@@ -6,6 +6,7 @@ import sys
 import subprocess
 import urllib.request
 import zipfile
+import shutil
 from pathlib import Path
 from jsonargparse import ArgumentParser
 
@@ -27,7 +28,96 @@ def download_file(url: str, output_path: str, desc: str = None):
         return False
 
 
-def download_ears_dataset(output_dir: str):
+def check_ears_health(ears_dir: Path) -> bool:
+    """Check if EARS dataset is already downloaded and healthy."""
+    if not ears_dir.exists():
+        return False
+    
+    # Check for at least some speaker directories (expect 107 speakers)
+    speaker_dirs = [d for d in ears_dir.iterdir() if d.is_dir() and d.name.startswith('p')]
+    
+    if len(speaker_dirs) < 50:  # Require at least 50 speakers to consider it healthy
+        return False
+    
+    # Check if speaker directories contain audio files
+    audio_extensions = {'.wav', '.flac', '.mp3'}
+    audio_files_found = 0
+    for speaker_dir in speaker_dirs[:10]:  # Sample first 10 speakers
+        audio_files = [f for f in speaker_dir.rglob('*') 
+                      if f.is_file() and f.suffix.lower() in audio_extensions]
+        if audio_files:
+            audio_files_found += 1
+    
+    # If at least 8 out of 10 sampled speakers have audio files, consider it healthy
+    if audio_files_found < 8:
+        return False
+    
+    # Check for metadata files (optional but good to have)
+    metadata_files = ['speaker_statistics.json', 'transcripts.json']
+    metadata_count = sum(1 for f in metadata_files if (ears_dir / f).exists())
+    
+    # Dataset is healthy if we have speakers with audio files
+    return True
+
+
+def check_vctk_health(vctk_dir: Path) -> bool:
+    """Check if VCTK dataset is already downloaded and healthy."""
+    if not vctk_dir.exists():
+        return False
+    
+    # Check if it's a git repository (from git clone)
+    if (vctk_dir / ".git").exists():
+        # Check if repository has content
+        if any(vctk_dir.iterdir()):
+            return True
+        return False
+    
+    # Check if it's a HuggingFace dataset (has data files)
+    # HuggingFace datasets typically have these structures:
+    # - data-* files or arrow files
+    # - dataset_info.json
+    # - Or a data/ subdirectory
+    
+    data_files = list(vctk_dir.glob("data-*"))
+    arrow_files = list(vctk_dir.glob("*.arrow"))
+    dataset_info = vctk_dir / "dataset_info.json"
+    data_dir = vctk_dir / "data"
+    
+    # Check for any of these indicators
+    if data_files or arrow_files or dataset_info.exists() or (data_dir.exists() and any(data_dir.iterdir())):
+        return True
+    
+    # Check for speaker directories (VCTK structure)
+    speaker_dirs = [d for d in vctk_dir.iterdir() if d.is_dir() and d.name.startswith('p')]
+    if len(speaker_dirs) > 10:  # VCTK has many speakers
+        # Check if they contain audio files
+        audio_extensions = {'.wav', '.flac'}
+        for speaker_dir in speaker_dirs[:5]:  # Sample first 5
+            audio_files = [f for f in speaker_dir.rglob('*') 
+                          if f.is_file() and f.suffix.lower() in audio_extensions]
+            if audio_files:
+                return True
+    
+    return False
+
+
+def check_dns_health(dns_dir: Path) -> bool:
+    """Check if DNS Challenge repository is already downloaded and healthy."""
+    if not dns_dir.exists():
+        return False
+    
+    # Check if it's a git repository
+    if (dns_dir / ".git").exists():
+        # Check if repository has content
+        files = list(dns_dir.iterdir())
+        # Should have at least README, download scripts, or other files
+        if len(files) > 3:  # .git, .gitignore, README, and more
+            return True
+    
+    return False
+
+
+def download_ears_dataset(output_dir: str, force: bool = False):
     """Download EARS dataset from GitHub releases."""
     print("\n" + "="*60)
     print("Downloading EARS Dataset")
@@ -36,6 +126,13 @@ def download_ears_dataset(output_dir: str):
     ears_dir = Path(output_dir) / "EARS"
     ears_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check if dataset is already downloaded and healthy
+    if not force and check_ears_health(ears_dir):
+        print(f"✓ EARS dataset already exists and appears healthy at {ears_dir}")
+        print("  Skipping download. Use --force to re-download.")
+        return ears_dir
+    
+    # If force mode, we still check for individual files to skip
     # Download all 107 speaker files
     base_url = "https://github.com/facebookresearch/ears_dataset/releases/download/dataset/"
     
@@ -43,8 +140,15 @@ def download_ears_dataset(output_dir: str):
     for i in range(1, 108):
         speaker_id = f"p{i:03d}"
         zip_file = ears_dir / f"{speaker_id}.zip"
+        speaker_dir = ears_dir / speaker_id
         
-        if zip_file.exists():
+        # Skip if already extracted (directory exists with content)
+        if speaker_dir.exists() and any(speaker_dir.iterdir()):
+            if not force:
+                print(f"Skipping {speaker_id} (already extracted)")
+                continue
+        # Skip if zip exists and we're not forcing
+        elif zip_file.exists() and not force:
             print(f"Skipping {speaker_id}.zip (already exists)")
             continue
         
@@ -86,7 +190,7 @@ def download_ears_dataset(output_dir: str):
     return ears_dir
 
 
-def download_vctk_dataset(output_dir: str):
+def download_vctk_dataset(output_dir: str, force: bool = False):
     """Download VCTK dataset from Hugging Face."""
     print("\n" + "="*60)
     print("Downloading VCTK Dataset")
@@ -94,6 +198,12 @@ def download_vctk_dataset(output_dir: str):
     
     vctk_dir = Path(output_dir) / "VCTK"
     vctk_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if dataset is already downloaded and healthy
+    if not force and check_vctk_health(vctk_dir):
+        print(f"✓ VCTK dataset already exists and appears healthy at {vctk_dir}")
+        print("  Skipping download. Use --force to re-download.")
+        return vctk_dir
     
     # Check if git is available
     try:
@@ -173,7 +283,7 @@ def download_vctk_dataset(output_dir: str):
         return None
 
 
-def download_dns_challenge(output_dir: str):
+def download_dns_challenge(output_dir: str, force: bool = False):
     """Download DNS Challenge dataset from GitHub."""
     print("\n" + "="*60)
     print("Downloading DNS Challenge Dataset")
@@ -181,6 +291,12 @@ def download_dns_challenge(output_dir: str):
     
     dns_dir = Path(output_dir) / "DNS-Challenge"
     dns_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if dataset is already downloaded and healthy
+    if not force and check_dns_health(dns_dir):
+        print(f"✓ DNS Challenge repository already exists and appears healthy at {dns_dir}")
+        print("  Skipping download. Use --force to re-download.")
+        return dns_dir
     
     # Check if git is available
     try:
@@ -190,33 +306,80 @@ def download_dns_challenge(output_dir: str):
         return None
     
     repo_url = "https://github.com/microsoft/DNS-Challenge.git"
-    repo_dir = dns_dir / "DNS-Challenge"
+    # Use dns_dir directly as the clone target to avoid nested directories
+    repo_dir = dns_dir
     
-    if repo_dir.exists():
+    # Check if .git directory exists (indicating it's already a git repo)
+    if (repo_dir / ".git").exists():
         print(f"Repository already exists at {repo_dir}")
         print("Pulling latest changes...")
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "pull"],
                 cwd=repo_dir,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                capture_output=True,
+                text=True
             )
-        except subprocess.CalledProcessError:
-            print("⚠ Warning: Could not pull latest changes. Using existing repository.")
+            if result.returncode == 0:
+                print("✓ Repository updated successfully!")
+            else:
+                print("⚠ Warning: Could not pull latest changes. Using existing repository.")
+        except Exception as e:
+            print(f"⚠ Warning: Could not pull latest changes: {e}. Using existing repository.")
     else:
+        # Check if directory exists and has files (but not a git repo)
+        if repo_dir.exists() and any(repo_dir.iterdir()) and not (repo_dir / ".git").exists():
+            print(f"⚠ Warning: Directory {repo_dir} exists but is not a git repository.")
+            print("  Removing existing directory to allow fresh clone...")
+            shutil.rmtree(repo_dir)
+            repo_dir.mkdir(parents=True, exist_ok=True)
+        
         print(f"Cloning {repo_url}...")
+        print(f"Target directory: {repo_dir}")
         try:
-            subprocess.run(
-                ["git", "clone", repo_url, str(repo_dir)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            # Ensure parent directory exists
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Try shallow clone first (faster)
+            print("Attempting shallow clone (depth=1)...")
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
+                capture_output=True,
+                text=True
             )
+            
+            if result.returncode != 0:
+                # If shallow clone fails, try full clone
+                print("Shallow clone failed, trying full clone...")
+                # Remove partial clone if it exists
+                if repo_dir.exists():
+                    shutil.rmtree(repo_dir)
+                    repo_dir.mkdir(parents=True, exist_ok=True)
+                
+                result = subprocess.run(
+                    ["git", "clone", repo_url, str(repo_dir)],
+                    capture_output=True,
+                    text=True
+                )
+            
+            if result.returncode != 0:
+                # Show the actual error
+                error_msg = result.stderr if result.stderr else result.stdout
+                print(f"✗ Error cloning DNS Challenge repository:")
+                print(f"  {error_msg}")
+                print(f"\n  Exit code: {result.returncode}")
+                print("\n  Troubleshooting:")
+                print("  - Check your internet connection")
+                print("  - Verify the repository URL is correct")
+                print("  - Try cloning manually: git clone https://github.com/microsoft/DNS-Challenge.git")
+                print(f"  - Check if directory is writable: {repo_dir.parent}")
+                return None
+            
             print("✓ Repository cloned successfully!")
-        except subprocess.CalledProcessError as e:
-            print(f"✗ Error cloning DNS Challenge repository: {e}")
+        except Exception as e:
+            print(f"✗ Unexpected error cloning DNS Challenge repository: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     # Check for download scripts
@@ -236,7 +399,7 @@ def download_dns_challenge(output_dir: str):
     return dns_dir
 
 
-def main(output_dir: str, datasets: list = None):
+def main(output_dir: str, datasets: list = None, force: bool = False):
     """
     Download specified datasets to the output directory.
     
@@ -244,6 +407,7 @@ def main(output_dir: str, datasets: list = None):
         output_dir: Directory where datasets will be downloaded
         datasets: List of datasets to download. Options: 'ears', 'vctk', 'dns'. 
                  If None, downloads all datasets.
+        force: If True, force re-download even if dataset exists and appears healthy
     """
     output_path = Path(output_dir).expanduser().absolute()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -253,6 +417,9 @@ def main(output_dir: str, datasets: list = None):
     print(f"{'='*60}")
     print(f"Output directory: {output_path}")
     
+    if force:
+        print("⚠ Force mode: Will re-download existing datasets")
+    
     if datasets is None:
         datasets = ['ears', 'vctk', 'dns']
     
@@ -261,13 +428,13 @@ def main(output_dir: str, datasets: list = None):
     results = {}
     
     if 'ears' in datasets:
-        results['ears'] = download_ears_dataset(str(output_path))
+        results['ears'] = download_ears_dataset(str(output_path), force=force)
     
     if 'vctk' in datasets:
-        results['vctk'] = download_vctk_dataset(str(output_path))
+        results['vctk'] = download_vctk_dataset(str(output_path), force=force)
     
     if 'dns' in datasets:
-        results['dns'] = download_dns_challenge(str(output_path))
+        results['dns'] = download_dns_challenge(str(output_path), force=force)
     
     # Summary
     print("\n" + "="*60)
@@ -298,6 +465,11 @@ if __name__ == "__main__":
         default=None,
         help="Specific datasets to download (default: all)"
     )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Force re-download even if dataset already exists and appears healthy"
+    )
     
     args = parser.parse_args()
     main(**args)
@@ -305,7 +477,7 @@ if __name__ == "__main__":
     """
     Usage examples:
     
-    # Download all datasets
+    # Download all datasets (skips if already downloaded and healthy)
     python download_datasets.py -o /path/to/datasets
     
     # Download only EARS and VCTK
@@ -313,5 +485,8 @@ if __name__ == "__main__":
     
     # Download only DNS Challenge
     python download_datasets.py -o /path/to/datasets -d dns
+    
+    # Force re-download even if datasets exist
+    python download_datasets.py -o /path/to/datasets -f
     """
 

@@ -864,4 +864,5 @@ if __name__ == "__main__":
 """
 usage:
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /mnt/inspurfs/home/wangpengyu/N-RKEM/v5/NeGI/data/sim_rir_final  
+  python /mnt/c/Users/reiem/PythonProjects/Rec-RIR/dataset/gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,50, 50]' --fs 16000 --rir_dir /mnt/c/Users/reiem/PythonProjects/Rec-RIR/data/rirs
 """
