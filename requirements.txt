@@ -9,6 +9,6 @@ soundfile
 tqdm
 toml
 typing
-tensorboard
+wandb
 jsonargparse
 matplotlib

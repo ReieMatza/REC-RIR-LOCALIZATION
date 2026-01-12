@@ -9,7 +9,7 @@ import time
 import logging
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from .utils import initialize_module
 
 
@@ -114,12 +114,20 @@ class BaseTrainer:
             self.model.load_state_dict(ckpt["model"], strict=False)
 
         if self.rank == 0:
-            self.writer = SummaryWriter(self.log_dir)
-            self.writer.add_text(
-                tag="config",
-                text_string=f"<pre>  \n{toml.dumps(config)}  \n</pre>",
-                global_step=1,
+            # Initialize WandB with config from TOML
+            wandb_config = config.get("wandb", {})            
+            wandb.init(
+                project=wandb_config.get("project", "rec-rir-localization"),
+                tags=wandb_config.get("tags", []),
+                notes=wandb_config.get("notes", ""),
+                config=config,
+                dir=self.log_dir,
+                mode=wandb_config.get("mode", "online"),
+                group=wandb_config.get("group") or None,
+                job_type=wandb_config.get("job_type", "train"),
+                resume="allow" if resume else None
             )
+            
             with open(
                 path.join(self.save_dir, f"{time.strftime('%Y-%m-%d-%H-%M-%S')}.toml"),
                 "w",
@@ -212,10 +220,9 @@ class BaseTrainer:
             self._train_epoch(epoch)
 
             if self.rank == 0:
-                self.writer.add_scalar(
-                    f"Lr",
-                    self.optimizer.param_groups[0]["lr"],
-                    epoch,
+                wandb.log(
+                    {"Lr": self.optimizer.param_groups[0]["lr"]},
+                    step=epoch,
                 )
 
             if epoch % self.valid_interval == 0:

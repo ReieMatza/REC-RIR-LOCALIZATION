@@ -3,6 +3,14 @@ seed = 2024
 cudnn_enable = true
 use_torch_compile = false  # Set to false to reduce memory usage
 
+[wandb]
+project = "rec-rir-localization"
+entity = ""  # WandB team/entity (optional, leave empty for personal account)
+name = ""  # Run name (optional, will auto-generate if empty)
+tags = ["training", "rec-rir"]
+notes = ""
+mode = "online"  # "online", "offline", or "disabled"
+
 [acoustic]
 path = "acoustics.feature.transforms"
 

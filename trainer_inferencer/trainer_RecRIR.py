@@ -7,6 +7,7 @@ from .utils import plot_spectrogram
 import torchaudio
 from model.lossF import RIMag_loss, MSE_loss_complex
 from torch.amp import GradScaler, autocast
+import wandb
 
 lossF_RIMag = RIMag_loss()
 lossF_MSE = MSE_loss_complex()
@@ -125,38 +126,18 @@ class Trainer(BaseTrainer):
             if (index) % 100 == 0:
 
                 if self.rank == 0:
-                    self.writer.add_scalar(
-                        f"Train_step/Lr",
-                        self.optimizer.param_groups[0]["lr"],
-                        self.steps,
-                    )
-                    self.writer.add_scalar(
-                        f"Train_step/Loss",
-                        loss_gd.item(),
-                        self.steps,
-                    )
-                    self.writer.add_scalar(
-                        f"Train_step/loss_cln",
-                        loss_cln.item(),
-                        self.steps,
-                    )
-                    self.writer.add_scalar(
-                        f"Train_step/loss_rvb",
-                        loss_rvb.item(),
-                        self.steps,
-                    )
-                    self.writer.add_scalar(
-                        f"Train_step/loss_rec",
-                        loss_rec.item(),
-                        self.steps,
-                    )
+                    wandb.log({
+                        "Train_step/Lr": self.optimizer.param_groups[0]["lr"],
+                        "Train_step/Loss": loss_gd.item(),
+                        "Train_step/loss_cln": loss_cln.item(),
+                        "Train_step/loss_rvb": loss_rvb.item(),
+                        "Train_step/loss_rec": loss_rec.item(),
+                    }, step=self.steps)
 
         if self.rank == 0:
-            self.writer.add_scalar(
-                f"Train_epoch/Loss",
-                loss_total / len(self.train_dataloader),
-                epoch,
-            )
+            wandb.log({
+                "Train_epoch/Loss": loss_total / len(self.train_dataloader),
+            }, step=epoch)
 
     @torch.no_grad()
     def _validation_epoch(self, epoch):
@@ -211,51 +192,21 @@ class Trainer(BaseTrainer):
             loss_total_rvb += loss_rvb
             loss_total_rec += loss_rec
             if self.rank == 0:
-                self.writer.add_scalar(
-                    f"Valid_epoch/Loss",
-                    loss_total / len(self.valid_dataloader) / dist.get_world_size(),
-                    epoch,
-                )
-                self.writer.add_scalar(
-                    f"Valid_epoch/loss_cln",
-                    loss_total_cln / len(self.valid_dataloader) / dist.get_world_size(),
-                    epoch,
-                )
-                self.writer.add_scalar(
-                    f"Valid_epoch/loss_rvb",
-                    loss_total_rvb / len(self.valid_dataloader) / dist.get_world_size(),
-                    epoch,
-                )
-                self.writer.add_scalar(
-                    f"Valid_epoch/loss_rec",
-                    loss_total_rec / len(self.valid_dataloader) / dist.get_world_size(),
-                    epoch,
-                )
+                wandb.log({
+                    "Valid_epoch/Loss": loss_total / len(self.valid_dataloader) / dist.get_world_size(),
+                    "Valid_epoch/loss_cln": loss_total_cln / len(self.valid_dataloader) / dist.get_world_size(),
+                    "Valid_epoch/loss_rvb": loss_total_rvb / len(self.valid_dataloader) / dist.get_world_size(),
+                    "Valid_epoch/loss_rec": loss_total_rec / len(self.valid_dataloader) / dist.get_world_size(),
+                }, step=epoch)
 
                 if index == 0:
-                    self.writer.add_figure(
-                        f"Valid_epoch/target_cln",
-                        plot_spectrogram(target_complex[0].abs().squeeze()),
-                    )
-                    self.writer.add_figure(
-                        f"Valid_epoch/input",
-                        plot_spectrogram(input_complex[0].abs().squeeze()),
-                    )
-                    self.writer.add_figure(
-                        f"Valid_epoch/target_reverb",
-                        plot_spectrogram(reverb_complex[0].abs().squeeze()),
-                    )
-                    self.writer.add_figure(
-                        f"Valid_epoch/est_cln",
-                        plot_spectrogram(est_spch[0].abs().squeeze()),
-                    )
-                    self.writer.add_figure(
-                        f"Valid_epoch/est_reverb",
-                        plot_spectrogram(recon[0].abs().squeeze()),
-                    )
-                    self.writer.add_figure(
-                        f"Valid_epoch/est_ctf",
-                        plot_spectrogram(est_ctf[0].abs().squeeze()),
-                    )
+                    wandb.log({
+                        "Valid_epoch/target_cln": wandb.Image(plot_spectrogram(target_complex[0].abs().squeeze())),
+                        "Valid_epoch/input": wandb.Image(plot_spectrogram(input_complex[0].abs().squeeze())),
+                        "Valid_epoch/target_reverb": wandb.Image(plot_spectrogram(reverb_complex[0].abs().squeeze())),
+                        "Valid_epoch/est_cln": wandb.Image(plot_spectrogram(est_spch[0].abs().squeeze())),
+                        "Valid_epoch/est_reverb": wandb.Image(plot_spectrogram(recon[0].abs().squeeze())),
+                        "Valid_epoch/est_ctf": wandb.Image(plot_spectrogram(est_ctf[0].abs().squeeze())),
+                    }, step=epoch)
 
         return loss_total / len(self.valid_dataloader) / dist.get_world_size()
