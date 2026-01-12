@@ -1,0 +1,15 @@
+/storage/reie/data/rec-rir/noise/NoiseX-92/babble.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/buccaneer1.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/buccaneer2.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/destroyerengine.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/destroyerops.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/f16.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/factory1.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/factory2.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/hfchannel.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/leopard.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/m109.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/machinegun.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/pink.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/volvo.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/white.wav
