@@ -39,7 +39,7 @@ class BaseDataset(Dataset):
         n_ch = wav_info.num_channels
         num_frames = wav_info.num_frames
 
-        assert sr_raw == sr_target, 'sample rate not match'
+        assert sr_raw == sr_target, f'sample rate not match: {wav_path} has {sr_raw} Hz, expected {sr_target} Hz'
         
         current_duration = num_frames/sr_target
         
