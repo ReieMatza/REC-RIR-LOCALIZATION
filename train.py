@@ -97,5 +97,5 @@ if __name__ == "__main__":
 
     entry(local_rank, config, args.resume, args.start_ckpt)
     """
-    usage: torchrun --standalone --nnodes=1 --nproc_per_node=[number of gpus] train.py -c [config .toml filepath] -p [saved dirpath]
+    usage: torchrun --standalone --nnodes=1 --nproc_per_node=1 train.py -c /storage/reie/REC-RIR-LOCALIZATION/config/Rec-RIR.toml -p /storage/reie/REC-RIR-LOCALIZATION/saved_dirpath
     """
