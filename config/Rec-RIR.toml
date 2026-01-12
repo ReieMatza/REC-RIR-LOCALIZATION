@@ -1,6 +1,7 @@
 [meta]
 seed = 2024
 cudnn_enable = true
+use_torch_compile = false  # Set to false to reduce memory usage
 
 [acoustic]
 path = "acoustics.feature.transforms"
@@ -31,12 +32,12 @@ hop_len = 256
 win_type = "sqrthann"
 
 [dataloader.args]
-src_pathlist = [ "config/train_spch.txt", "config/valid_spch.txt", "config/valid_spch.txt",]
-rir_pathlist = [ "config/train_rir.txt", "config/valid_rir.txt", "config/valid_rir.txt",]
-noise_pathlist = [ "config/train_noise_stationary.txt", "config/valid_noise_stationary.txt", "config/valid_noise_stationary.txt",]
+src_pathlist = [ "config/reie_train_speech.txt", "config/reie_validation_speech.txt", "config/reie_validation_speech.txt",]
+rir_pathlist = [ "config/reie_train_rir.txt", "config/reie_validation_rir.txt", "config/reie_validation_rir.txt",]
+noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
 snr_range = [ 5, 20,]
 seq_lenlist = [ 4.0, 6.0, 4.0,]
-batchsize = [ 4, 4, 1,]
+batchsize = [ 4, 4, 2,]
 num_workers = 8
 seeds = [ 2022, 2023, 2024,]
 pin_memory = true

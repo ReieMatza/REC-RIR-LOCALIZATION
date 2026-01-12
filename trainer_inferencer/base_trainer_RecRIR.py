@@ -33,7 +33,17 @@ class BaseTrainer:
         self.model = DDP(
             model.cuda(rank), device_ids=[rank], find_unused_parameters=False
         )
-        self.compiled_model = torch.compile(self.model)
+        
+        # Conditionally compile model based on config
+        use_compile = config["meta"].get("use_torch_compile", True)
+        if use_compile:
+            self.compiled_model = torch.compile(self.model)
+            if rank == 0:
+                print("Using torch.compile for model optimization")
+        else:
+            self.compiled_model = self.model
+            if rank == 0:
+                print("torch.compile disabled - using standard model")
 
         self.optimizer = optimizer
         self.scheduler = scheduler
