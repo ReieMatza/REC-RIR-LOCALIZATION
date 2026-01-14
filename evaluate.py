@@ -14,9 +14,159 @@ import torchaudio
 
 from trainer_inferencer.utils import initialize_module
 from model.lossF import RIMag_loss, MSE_loss_complex
+import torch.nn.functional as F
 
 import warnings
 warnings.filterwarnings("ignore")
+
+
+# ============================================================================
+# MultiResolution STFT Loss Classes (from Acoustic_Localization_one_mic)
+# ============================================================================
+
+def stft(x, fft_size, hop_size, win_length, window):
+    """Perform STFT and convert to magnitude spectrogram.
+    Args:
+        x (Tensor): Input signal tensor (B, T).
+        fft_size (int): FFT size.
+        hop_size (int): Hop size.
+        win_length (int): Window length.
+        window (str): Window function type.
+    Returns:
+        Tensor: Magnitude spectrogram (B, fft_size // 2 + 1, #Frames).
+    """
+    x_stft = torch.stft(x.float(), fft_size, hop_size, win_length, window, return_complex=True)
+    x_mag = torch.sqrt(torch.clamp((x_stft.real**2) + (x_stft.imag**2), min=1e-8))
+    return x_mag
+
+
+class SpectralConvergenceLoss(torch.nn.Module):
+    """Spectral convergence loss module."""
+
+    def __init__(self):
+        """Initilize spectral convergence loss module."""
+        super(SpectralConvergenceLoss, self).__init__()
+
+    def forward(self, x_mag, y_mag):
+        """Calculate forward propagation.
+        Args:
+            x_mag (Tensor): Magnitude spectrogram of predicted signal (B, #freq_bins, #frames).
+            y_mag (Tensor): Magnitude spectrogram of groundtruth signal (B, #freq_bins, #frames).
+        Returns:
+            Tensor: Spectral convergence loss value.
+        """
+        return torch.norm(y_mag.float() - x_mag.float(), p="fro") / (torch.norm(y_mag.float(), p="fro") + 1e-12)
+
+
+class LogSTFTMagnitudeLoss(torch.nn.Module):
+    """Log STFT magnitude loss module."""
+
+    def __init__(self):
+        """Initilize los STFT magnitude loss module."""
+        super(LogSTFTMagnitudeLoss, self).__init__()
+
+    def forward(self, x_mag, y_mag):
+        """Calculate forward propagation.
+        Args:
+            x_mag (Tensor): Magnitude spectrogram of predicted signal (B,  #freq_bins, #frames).
+            y_mag (Tensor): Magnitude spectrogram of groundtruth signal (B,  #freq_bins, #frames).
+        Returns:
+            Tensor: Log STFT magnitude loss value.
+        """
+        return F.l1_loss(torch.log(y_mag.float()), torch.log(x_mag.float()))
+
+
+class STFTLoss(torch.nn.Module):
+    """STFT loss module."""
+
+    def __init__(
+        self,
+        fft_size=1024,
+        shift_size=120,
+        win_length=600,
+        window="hann_window",
+    ):
+        """Initialize STFT loss module."""
+        super(STFTLoss, self).__init__()
+        self.fft_size = fft_size
+        self.shift_size = shift_size
+        self.win_length = win_length
+        self.register_buffer("window", getattr(torch, window)(win_length))
+        self.spectral_convergence_loss = SpectralConvergenceLoss()
+        self.log_stft_magnitude_loss = LogSTFTMagnitudeLoss()
+
+    def forward(self, x, y):
+        """Calculate forward propagation.
+        Args:
+            x (Tensor): Predicted signal (B, T).
+            y (Tensor): Groundtruth signal (B, T).
+        Returns:
+            Tensor: Spectral convergence loss value.
+            Tensor: Log STFT magnitude loss value.
+        """
+        x_mag = stft(x, self.fft_size, self.shift_size, self.win_length, self.window)
+        y_mag = stft(y, self.fft_size, self.shift_size, self.win_length, self.window)
+        sc_loss = self.spectral_convergence_loss(x_mag, y_mag)
+        log_mag_loss = self.log_stft_magnitude_loss(x_mag, y_mag)
+        return sc_loss, log_mag_loss
+
+
+class MultiResolutionSTFTLoss(torch.nn.Module):
+    """Multi resolution STFT loss module."""
+
+    def __init__(
+        self,
+        fft_sizes=[64, 512, 2048, 8192],
+        hop_sizes=[32, 256, 1024, 4096],
+        win_lengths=[64, 512, 2048, 8192],
+        window="hann_window",
+        sc_weight=1.0,
+        mag_weight=1.0,
+    ):
+        """Initialize Multi resolution STFT loss module.
+        Args:
+            fft_sizes (list): List of FFT sizes.
+            hop_sizes (list): List of hop sizes.
+            win_lengths (list): List of window lengths.
+            window (str): Window function type.
+            factor (float): a balancing factor across different losses.
+        """
+        super(MultiResolutionSTFTLoss, self).__init__()
+        assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
+        self.stft_losses = torch.nn.ModuleList()
+        self.fft_sizes = fft_sizes
+        self.sc_weight = sc_weight
+        self.mag_weight = mag_weight
+
+        for fs, ss, wl in zip(fft_sizes, hop_sizes, win_lengths):
+            self.stft_losses = self.stft_losses + [STFTLoss(fs, ss, wl, window)]
+
+    def forward(self, x, y):
+        """Calculate forward propagation.
+        Args:
+            x (Tensor): Predicted signal (B, 1, T).
+            y (Tensor): Groundtruth signal (B, 1, T).
+        Returns:
+            Tensor: Multi resolution spectral convergence loss value.
+            Tensor: Multi resolution log STFT magnitude loss value.
+        """
+        sc_loss = 0.0
+        mag_loss = 0.0
+        x = x.squeeze(1)
+        y = y.squeeze(1)
+
+        for i, f in enumerate(self.stft_losses):
+            sc_l, mag_l = f(x, y)
+            sc_loss = sc_loss + sc_l
+            mag_loss = mag_loss + mag_l
+
+        return {
+            "total": (sc_loss * self.sc_weight + mag_loss * self.mag_weight) / len(self.stft_losses),
+            "sc_loss": sc_loss / len(self.stft_losses),
+            "mag_loss": mag_loss / len(self.stft_losses),
+        }
+
+# ============================================================================
 
 
 def evaluate(config_path, checkpoint_path, num_samples, device):
@@ -108,12 +258,35 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     print(f"Using loss type: {loss_type}")
     print(f"Loss weights - Clean: {loss_w_cln}, Reverb: {loss_w_rvb}, Recon: {loss_w_rec}")
     
+    # Initialize PIM module for RIR estimation
+    print("Initializing PIM module for RIR estimation...")
+    pim = initialize_module(config["EM_algo"]["path"], config["EM_algo"]["args"])
+    
+    # Initialize MultiResolution STFT Loss for RIR evaluation
+    print("Initializing MultiResolution STFT Loss...")
+    mrstft_loss = MultiResolutionSTFTLoss(
+        fft_sizes=[64, 512, 2048, 8192],
+        hop_sizes=[32, 256, 1024, 4096],
+        win_lengths=[64, 512, 2048, 8192],
+        window="hann_window",
+        sc_weight=1.0,
+        mag_weight=1.0,
+    ).to(device)
+    
+    # Access ground truth RIR paths from validation dataset
+    valid_dataset = valid_dataloader.dataset
+    rir_pathlist = valid_dataset.rir_pathlist
+    print(f"Found {len(rir_pathlist)} RIR files in validation dataset")
+    
     # Evaluation loop
     print(f"\nEvaluating on {num_samples} samples...")
     loss_total = 0.0
     loss_total_cln = 0.0
     loss_total_rvb = 0.0
     loss_total_rec = 0.0
+    loss_mrstft_total = 0.0
+    loss_mrstft_sc = 0.0
+    loss_mrstft_mag = 0.0
     
     samples_evaluated = 0
     
@@ -159,6 +332,99 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                 + loss_w_rvb * loss_rvb
             )
             
+            # ===== RIR Quality Evaluation using MRSTFT Loss =====
+            # Get RIR index (deterministic since shuffle=False for validation)
+            rir_idx = index % len(rir_pathlist)
+            rir_path = rir_pathlist[rir_idx]
+            
+            # Load ground truth RIR
+            try:
+                # Check if it's .npz format (contains both rir and rir_dp)
+                if rir_path.endswith('.npz'):
+                    rir_dict = np.load(rir_path)
+                    gt_rir = torch.from_numpy(rir_dict["rir"][0]).float().to(device)
+                    # Normalize
+                    scale_rir = gt_rir.abs().max()
+                    if scale_rir > 0:
+                        gt_rir = gt_rir / scale_rir
+                else:
+                    # Load from wav file
+                    gt_rir = transformfunc.load_wav(rir_path, transformfunc.sr).to(device)
+                    # Normalize
+                    if gt_rir.abs().max() > 0:
+                        gt_rir = gt_rir / gt_rir.abs().max()
+                
+                # Estimate RIR from CTF using PIM sine sweep method
+                # Flip CTF as done in PIM.init_seg (line 71)
+                est_ctf_flipped = est_ctf.flip(-1)  # [B, C, F, L]
+                batch_size = est_ctf_flipped.shape[0]
+                L = est_ctf_flipped.shape[-1]  # CTF length dimension
+                
+                # Use PIM's sine sweep for CTF to RIR conversion
+                sinesweep = pim.sinesweep.to(device)
+                invfilter = pim.invfilter.to(device)
+                sinesweep_spec = transformfunc.stft(sinesweep, "complex")  # [F, T]
+                
+                # Process each sample in batch
+                est_rirs = []
+                for b in range(batch_size):
+                    # Pad sine sweep spectrum for convolution
+                    sinesweep_spec_padded = torch.nn.functional.pad(
+                        sinesweep_spec, (L - 1, L - 1)
+                    )  # [F, T+2L-2]
+                    
+                    # Unfold for convolution operation
+                    sinesweep_spec_unfolded = sinesweep_spec_padded.unfold(1, L, 1)  # [F, T, L]
+                    
+                    # Get CTF for this sample [F, L]
+                    ctf_sample = est_ctf_flipped[b, 0, :, :].unsqueeze(-1)  # [F, L, 1]
+                    
+                    # Convolve in frequency domain
+                    ir_spec = torch.matmul(sinesweep_spec_unfolded, ctf_sample).squeeze(-1)  # [F, T]
+                    
+                    # Convert to time domain
+                    ir = transformfunc.istft(ir_spec, "complex")  # [T]
+                    
+                    # Deconvolve with inverse filter
+                    est_rir = torchaudio.functional.convolve(invfilter, ir, mode="full")
+                    
+                    # Trim to match expected length (find peak and trim)
+                    if est_rir.abs().max() > 0:
+                        peak_idx = torch.argmax(est_rir.abs())
+                        start_idx = max(0, peak_idx - int(transformfunc.sr * 0.0025))
+                        est_rir = est_rir[start_idx:]
+                        est_rir = est_rir[:transformfunc.sr * 2]  # 2 seconds max
+                        
+                        # Normalize
+                        if est_rir.abs().max() > 1:
+                            est_rir = est_rir / est_rir.abs().max()
+                    
+                    est_rirs.append(est_rir)
+                
+                # Pad/truncate to same length for loss calculation
+                max_len = max(gt_rir.shape[-1], max(r.shape[-1] for r in est_rirs))
+                gt_rir_padded = torch.nn.functional.pad(gt_rir, (0, max_len - gt_rir.shape[-1]))
+                est_rir_batch = torch.stack([
+                    torch.nn.functional.pad(r, (0, max_len - r.shape[-1])) 
+                    for r in est_rirs
+                ])
+                
+                # Calculate MultiResolution STFT Loss
+                # MRSTFT expects shape [B, 1, T]
+                mrstft_result = mrstft_loss(
+                    est_rir_batch.unsqueeze(1), 
+                    gt_rir_padded.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+                )
+                
+                # Accumulate MRSTFT losses
+                loss_mrstft_total += mrstft_result["total"].item() * batch_size
+                loss_mrstft_sc += mrstft_result["sc_loss"].item() * batch_size
+                loss_mrstft_mag += mrstft_result["mag_loss"].item() * batch_size
+                
+            except Exception as e:
+                print(f"\nWarning: Could not compute MRSTFT loss for batch {index}: {e}")
+                # Continue without adding to MRSTFT loss
+            
             # Accumulate losses
             loss_total += loss.item()
             loss_total_cln += loss_cln.item()
@@ -172,6 +438,9 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     avg_loss_cln = loss_total_cln / samples_evaluated
     avg_loss_rvb = loss_total_rvb / samples_evaluated
     avg_loss_rec = loss_total_rec / samples_evaluated
+    avg_mrstft_total = loss_mrstft_total / samples_evaluated
+    avg_mrstft_sc = loss_mrstft_sc / samples_evaluated
+    avg_mrstft_mag = loss_mrstft_mag / samples_evaluated
     
     # Print results
     print(f"\n{'='*50}")
@@ -181,6 +450,11 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     print(f"Clean Loss:     {avg_loss_cln:.6f}")
     print(f"Reverb Loss:    {avg_loss_rvb:.6f}")
     print(f"Recon Loss:     {avg_loss_rec:.6f}")
+    print(f"{'-'*50}")
+    print(f"RIR Quality (MultiResolution STFT):")
+    print(f"  Total:        {avg_mrstft_total:.6f}")
+    print(f"  Spectral Conv:{avg_mrstft_sc:.6f}")
+    print(f"  Log Magnitude:{avg_mrstft_mag:.6f}")
     print(f"{'='*50}\n")
 
 
