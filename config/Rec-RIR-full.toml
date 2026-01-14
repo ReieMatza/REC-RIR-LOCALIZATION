@@ -40,12 +40,12 @@ hop_len = 256
 win_type = "sqrthann"
 
 [dataloader.args]
-src_pathlist = [ "config/reie_train_speech_dev.txt", "config/reie_validation_speech_dev.txt", "config/reie_validation_speech_dev.txt",]
-rir_pathlist = [ "config/reie_train_rir_dev.txt", "config/reie_validation_rir_dev.txt", "config/reie_validation_rir_dev.txt",]
+src_pathlist = [ "config/reie_train_speech.txt", "config/reie_validation_speech.txt", "config/reie_validation_speech.txt",]
+rir_pathlist = [ "config/reie_train_rir.txt", "config/reie_validation_rir.txt", "config/reie_validation_rir.txt",]
 noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
 snr_range = [ 5, 20,]
 seq_lenlist = [ 4.0, 6.0, 4.0,]
-batchsize = [ 2, 2, 1,]
+batchsize = [ 4, 4, 2,]
 num_workers = 8
 seeds = [ 2022, 2023, 2024,]
 pin_memory = true
