@@ -222,7 +222,7 @@ class BaseTrainer:
             if self.rank == 0:
                 wandb.log(
                     {"Lr": self.optimizer.param_groups[0]["lr"]},
-                    step=epoch,
+                    step=self.steps,
                 )
 
             if epoch % self.valid_interval == 0:

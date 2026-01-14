@@ -137,7 +137,7 @@ class Trainer(BaseTrainer):
         if self.rank == 0:
             wandb.log({
                 "Train_epoch/Loss": loss_total / len(self.train_dataloader),
-            }, step=epoch)
+            }, step=self.steps)
 
     @torch.no_grad()
     def _validation_epoch(self, epoch):
@@ -197,7 +197,7 @@ class Trainer(BaseTrainer):
                     "Valid_epoch/loss_cln": loss_total_cln / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rvb": loss_total_rvb / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rec": loss_total_rec / len(self.valid_dataloader) / dist.get_world_size(),
-                }, step=epoch)
+                }, step=self.steps)
 
                 if index == 0:
                     wandb.log({
@@ -207,6 +207,6 @@ class Trainer(BaseTrainer):
                         "Valid_epoch/est_cln": wandb.Image(plot_spectrogram(est_spch[0].abs().squeeze())),
                         "Valid_epoch/est_reverb": wandb.Image(plot_spectrogram(recon[0].abs().squeeze())),
                         "Valid_epoch/est_ctf": wandb.Image(plot_spectrogram(est_ctf[0].abs().squeeze())),
-                    }, step=epoch)
+                    }, step=self.steps)
 
         return loss_total / len(self.valid_dataloader) / dist.get_world_size()
