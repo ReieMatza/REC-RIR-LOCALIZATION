@@ -290,10 +290,23 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     
     samples_evaluated = 0
     
+    # Create progress bar that tracks samples, not batches
+    pbar = tqdm(total=num_samples, desc="Evaluating", unit="sample")
+    
     with torch.no_grad():
-        for index, (noisy_wav, rev_wav, dp_wav, fpath) in enumerate(tqdm(valid_dataloader, desc="Evaluating")):
+        for index, (noisy_wav, rev_wav, dp_wav, fpath) in enumerate(valid_dataloader):
             if samples_evaluated >= num_samples:
                 break
+            
+            batch_size = noisy_wav.shape[0]
+            # Adjust batch size if we're near the limit
+            remaining_samples = num_samples - samples_evaluated
+            if remaining_samples < batch_size:
+                # Only process the samples we need
+                noisy_wav = noisy_wav[:remaining_samples]
+                rev_wav = rev_wav[:remaining_samples]
+                dp_wav = dp_wav[:remaining_samples]
+                batch_size = remaining_samples
             
             # Move data to device
             noisy_wav = noisy_wav.to(device)
@@ -402,18 +415,22 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                     est_rirs.append(est_rir)
                 
                 # Pad/truncate to same length for loss calculation
-                max_len = max(gt_rir.shape[-1], max(r.shape[-1] for r in est_rirs))
-                gt_rir_padded = torch.nn.functional.pad(gt_rir, (0, max_len - gt_rir.shape[-1]))
+                # Ensure gt_rir is 1D (flatten if needed)
+                gt_rir_1d = gt_rir.flatten()  # [T]
+                max_len = max(gt_rir_1d.shape[-1], max(r.shape[-1] for r in est_rirs))
+                gt_rir_padded = torch.nn.functional.pad(gt_rir_1d, (0, max_len - gt_rir_1d.shape[-1]))  # [T]
                 est_rir_batch = torch.stack([
                     torch.nn.functional.pad(r, (0, max_len - r.shape[-1])) 
                     for r in est_rirs
-                ])
+                ])  # [B, T]
                 
                 # Calculate MultiResolution STFT Loss
                 # MRSTFT expects shape [B, 1, T]
+                # Expand gt_rir_padded to match batch size: [T] -> [B, 1, T]
+                gt_rir_batch = gt_rir_padded.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)  # [B, 1, T]
                 mrstft_result = mrstft_loss(
-                    est_rir_batch.unsqueeze(1), 
-                    gt_rir_padded.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+                    est_rir_batch.unsqueeze(1),  # [B, 1, T]
+                    gt_rir_batch  # [B, 1, T]
                 )
                 
                 # Accumulate MRSTFT losses
@@ -431,7 +448,10 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
             loss_total_rvb += loss_rvb.item()
             loss_total_rec += loss_rec.item()
             
-            samples_evaluated += noisy_wav.shape[0]  # batch size
+            samples_evaluated += batch_size
+            pbar.update(batch_size)
+    
+    pbar.close()
     
     # Calculate average losses
     avg_loss_total = loss_total / samples_evaluated
@@ -468,14 +488,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-k", "--checkpoint",
-        required=True,
+        default="saved_dirpath/ckpt/best.tar",
         type=str,
         help="Path to model checkpoint (required)"
     )
     parser.add_argument(
         "-n", "--num_samples",
         type=int,
-        default=20,
+        default=50,
         help="Number of samples to evaluate (default: 20)"
     )
     parser.add_argument(
