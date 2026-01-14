@@ -24,6 +24,85 @@ warnings.filterwarnings("ignore")
 # MultiResolution STFT Loss Classes (from Acoustic_Localization_one_mic)
 # ============================================================================
 
+def calculate_rt60(rir, sr=16000):
+    """
+    Calculate RT60 (Reverberation Time) from Room Impulse Response
+    
+    Args:
+        rir: Room impulse response tensor [T]
+        sr: Sample rate
+        
+    Returns:
+        RT60 value in seconds
+    """
+    # Convert to numpy for easier processing
+    if torch.is_tensor(rir):
+        rir = rir.cpu().numpy()
+    
+    # Ensure 1D
+    rir = np.squeeze(rir)
+    
+    # Calculate energy decay curve (EDC)
+    rir_squared = rir ** 2
+    edc = np.flip(np.cumsum(np.flip(rir_squared)))
+    
+    # Convert to dB
+    edc_db = 10 * np.log10(edc + 1e-12)
+    edc_db = edc_db - edc_db[0]  # Normalize to 0 dB at start
+    
+    # Find indices where energy drops by 5dB and 35dB
+    idx_5db = np.where(edc_db <= -5)[0][0]
+    idx_35db = np.where(edc_db <= -35)[0][0]
+    
+    # Linear regression on -5dB to -35dB range
+    time_5db = idx_5db / sr
+    time_35db = idx_35db / sr
+    
+    # Extrapolate to 60dB decay
+    decay_rate = -30 / (time_35db - time_5db)  # dB per second
+    rt60 = 60 / abs(decay_rate)
+    
+    return rt60
+
+
+
+def calculate_drr(rir, sr=16000, direct_window_ms=2.5):
+    """
+    Calculate DRR (Direct-to-Reverberant Ratio) from Room Impulse Response
+    
+    Args:
+        rir: Room impulse response tensor [T]
+        sr: Sample rate
+        direct_window_ms: Window size in ms for direct sound (default: 2.5ms)
+        
+    Returns:
+        DRR value in dB
+    """
+    # Convert to numpy for easier processing
+    if torch.is_tensor(rir):
+        rir = rir.cpu().numpy()
+    
+    # Ensure 1D
+    rir = np.squeeze(rir)
+    
+    # Find peak (direct sound)
+    peak_idx = np.argmax(np.abs(rir))
+    
+    # Calculate direct sound window
+    direct_samples = int(direct_window_ms * sr / 1000)
+    direct_start = max(0, peak_idx - direct_samples // 2)
+    direct_end = min(len(rir), peak_idx + direct_samples // 2)
+    
+    # Calculate energies
+    direct_energy = np.sum(rir[direct_start:direct_end] ** 2)
+    reverb_energy = np.sum(rir[direct_end:] ** 2)
+    
+    # Calculate DRR in dB
+    drr = 10 * np.log10((direct_energy + 1e-12) / (reverb_energy + 1e-12))
+    
+    return drr
+
+
 def stft(x, fft_size, hop_size, win_length, window):
     """Perform STFT and convert to magnitude spectrogram.
     Args:
@@ -288,6 +367,13 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     loss_mrstft_sc = 0.0
     loss_mrstft_mag = 0.0
     
+    # RT60 and DRR metric accumulators
+    rt60_mae_total = 0.0
+    rt60_rmse_total = 0.0
+    drr_mae_total = 0.0
+    drr_rmse_total = 0.0
+    acoustic_metrics_count = 0
+    
     samples_evaluated = 0
     
     # Create progress bar that tracks samples, not batches
@@ -438,6 +524,36 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                 loss_mrstft_sc += mrstft_result["sc_loss"].item() * batch_size
                 loss_mrstft_mag += mrstft_result["mag_loss"].item() * batch_size
                 
+                # ===== Calculate RT60 and DRR metrics =====
+                # Calculate RT60 and DRR for each sample in batch
+                for b in range(batch_size):
+                    # Get estimated and ground truth RIRs
+                    est_rir_sample = est_rirs[b]
+                    gt_rir_sample = gt_rir_1d
+                    
+                    # Calculate RT60
+                    rt60_est = calculate_rt60(est_rir_sample, sr=transformfunc.sr)
+                    rt60_gt = calculate_rt60(gt_rir_sample, sr=transformfunc.sr)
+                    
+                    # Calculate DRR
+                    drr_est = calculate_drr(est_rir_sample, sr=transformfunc.sr)
+                    drr_gt = calculate_drr(gt_rir_sample, sr=transformfunc.sr)
+                    
+                    # Calculate errors (MAE and squared error for RMSE)
+                    rt60_error = abs(rt60_est - rt60_gt)
+                    rt60_squared_error = (rt60_est - rt60_gt) ** 2
+                    drr_error = abs(drr_est - drr_gt)
+                    drr_squared_error = (drr_est - drr_gt) ** 2
+                    
+                    # Accumulate
+                    rt60_mae_total += rt60_error
+                    rt60_rmse_total += rt60_squared_error
+                    drr_mae_total += drr_error
+                    drr_rmse_total += drr_squared_error
+                    acoustic_metrics_count += 1
+                        
+
+                
             except Exception as e:
                 print(f"\nWarning: Could not compute MRSTFT loss for batch {index}: {e}")
                 # Continue without adding to MRSTFT loss
@@ -462,6 +578,15 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     avg_mrstft_sc = loss_mrstft_sc / samples_evaluated
     avg_mrstft_mag = loss_mrstft_mag / samples_evaluated
     
+    # Calculate average RT60 and DRR metrics
+    if acoustic_metrics_count > 0:
+        avg_rt60_mae = rt60_mae_total / acoustic_metrics_count
+        avg_rt60_rmse = np.sqrt(rt60_rmse_total / acoustic_metrics_count)
+        avg_drr_mae = drr_mae_total / acoustic_metrics_count
+        avg_drr_rmse = np.sqrt(drr_rmse_total / acoustic_metrics_count)
+    else:
+        avg_rt60_mae = avg_rt60_rmse = avg_drr_mae = avg_drr_rmse = 0.0
+    
     # Print results
     print(f"\n{'='*50}")
     print(f"Evaluation Results ({samples_evaluated} samples):")
@@ -475,6 +600,12 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     print(f"  Total:        {avg_mrstft_total:.6f}")
     print(f"  Spectral Conv:{avg_mrstft_sc:.6f}")
     print(f"  Log Magnitude:{avg_mrstft_mag:.6f}")
+    print(f"{'-'*50}")
+    print(f"Acoustic Metrics (RT60 & DRR):")
+    print(f"  RT60 MAE:     {avg_rt60_mae:.6f} s")
+    print(f"  RT60 RMSE:    {avg_rt60_rmse:.6f} s")
+    print(f"  DRR MAE:      {avg_drr_mae:.6f} dB")
+    print(f"  DRR RMSE:     {avg_drr_rmse:.6f} dB")
     print(f"{'='*50}\n")
 
 
