@@ -457,48 +457,10 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                 # Flip CTF as done in PIM.init_seg (line 71)
                 est_ctf_flipped = est_ctf.flip(-1)  # [B, C, F, L]
                 batch_size = est_ctf_flipped.shape[0]
-                L = est_ctf_flipped.shape[-1]  # CTF length dimension
                 
-                # Use PIM's sine sweep for CTF to RIR conversion
-                sinesweep = pim.sinesweep.to(device)
-                invfilter = pim.invfilter.to(device)
-                sinesweep_spec = transformfunc.stft(sinesweep, "complex")  # [F, T]
-                
-                # Process each sample in batch
-                est_rirs = []
-                for b in range(batch_size):
-                    # Pad sine sweep spectrum for convolution
-                    sinesweep_spec_padded = torch.nn.functional.pad(
-                        sinesweep_spec, (L - 1, L - 1)
-                    )  # [F, T+2L-2]
-                    
-                    # Unfold for convolution operation
-                    sinesweep_spec_unfolded = sinesweep_spec_padded.unfold(1, L, 1)  # [F, T, L]
-                    
-                    # Get CTF for this sample [F, L]
-                    ctf_sample = est_ctf_flipped[b, 0, :, :].unsqueeze(-1)  # [F, L, 1]
-                    
-                    # Convolve in frequency domain
-                    ir_spec = torch.matmul(sinesweep_spec_unfolded, ctf_sample).squeeze(-1)  # [F, T]
-                    
-                    # Convert to time domain
-                    ir = transformfunc.istft(ir_spec, "complex")  # [T]
-                    
-                    # Deconvolve with inverse filter
-                    est_rir = torchaudio.functional.convolve(invfilter, ir, mode="full")
-                    
-                    # Trim to match expected length (find peak and trim)
-                    if est_rir.abs().max() > 0:
-                        peak_idx = torch.argmax(est_rir.abs())
-                        start_idx = max(0, peak_idx - int(transformfunc.sr * 0.0025))
-                        est_rir = est_rir[start_idx:]
-                        est_rir = est_rir[:transformfunc.sr * 2]  # 2 seconds max
-                        
-                        # Normalize
-                        if est_rir.abs().max() > 1:
-                            est_rir = est_rir / est_rir.abs().max()
-                    
-                    est_rirs.append(est_rir)
+                # Use refactored PIM method to convert CTF to RIR (handles batching internally)
+                # Keep on device for loss calculation
+                est_rirs = pim.ctf_to_rir(est_ctf_flipped, transformfunc, device, return_device=device)
                 
                 # Pad/truncate to same length for loss calculation
                 # Ensure gt_rir is 1D (flatten if needed)

@@ -73,31 +73,101 @@ class PIM:
 
         return CTF
 
-    @torch.no_grad()
-    def process(self, Obs_wav, model, TF, device, *args, **kwargs):
-
-        CTF = self.init_seg(TF, model, Obs_wav)
+    def ctf_to_rir(self, CTF, TF, device, return_device="cpu"):
+        """
+        Convert CTF (Channel Transfer Function) to RIR (Room Impulse Response) using sine sweep method.
+        
+        Args:
+            CTF: Channel Transfer Function tensor
+                - Single sample: [F, L] complex
+                - Batch: [B, C, F, L] complex (will process each sample)
+            TF: Transform function object with stft/istft methods
+            device: Device to run computation on
+            return_device: Device for output RIR tensors (default: "cpu")
+                - "cpu": Move RIRs to CPU (for inference/saving)
+                - device: Keep RIRs on computation device (for further processing/loss calculation)
+            
+        Returns:
+            RIR tensor(s):
+                - Single sample: [T] on return_device
+                - Batch: List of [T] tensors on return_device
+        """
+        # Check if CTF is batched
+        is_batch = CTF.ndim == 4  # [B, C, F, L]
+        
+        if is_batch:
+            # Process each sample in batch
+            batch_size = CTF.shape[0]
+            rirs = []
+            for b in range(batch_size):
+                # Extract single sample [F, L] (taking first channel if multi-channel)
+                ctf_single = CTF[b, 0, :, :]
+                rir_single = self._ctf_to_rir_single(ctf_single, TF, device, return_device)
+                rirs.append(rir_single)
+            return rirs
+        else:
+            # Single sample processing
+            return self._ctf_to_rir_single(CTF, TF, device, return_device)
+    
+    def _ctf_to_rir_single(self, CTF, TF, device, return_device="cpu"):
+        """
+        Convert a single CTF to RIR using sine sweep method.
+        
+        Args:
+            CTF: [F, L] complex tensor
+            TF: Transform function object
+            device: Device to run computation on
+            return_device: Device for output RIR tensor (default: "cpu")
+            
+        Returns:
+            RIR: [T] tensor on return_device
+        """
         L = CTF.shape[-1]
-
+        
         sinesweep = self.sinesweep.to(device)
         invfilter = self.invfilter.to(device)
         sinesweep_spec = TF.stft(sinesweep, "complex")
-
+        
         CTF_ret = CTF.unsqueeze(2)
-
+        
         sinesweep_spec = pad(sinesweep_spec, (L - 1, L - 1))  # [F,T+L-1]
         sinesweep_spec = sinesweep_spec.unfold(1, L, 1)  # [F,T,L] complex
-
+        
         ir_spec = torch.matmul(sinesweep_spec, CTF_ret).squeeze()
         ir = TF.istft(ir_spec, "complex")
-
-        rir = torchaudio.functional.convolve(invfilter, ir, mode="full").to("cpu")
-
+        
+        rir = torchaudio.functional.convolve(invfilter, ir, mode="full").to(return_device)
+        
         rir = rir[torch.argmax(rir.abs()) - int(self.sr * 0.0025) :]
         if rir.abs().max() > 1:
             rir /= rir.abs().max()
-
+        
         return rir[:self.sr*2]
+
+    @torch.no_grad()
+    def process(self, Obs_wav=None, model=None, TF=None, device=None, CTF=None, *args, **kwargs):
+        """
+        Process audio to estimate RIR.
+        
+        Args:
+            Obs_wav: Observed audio waveform (required if CTF not provided)
+            model: Neural network model (required if CTF not provided)
+            TF: Transform function object (required)
+            device: Device to run computation on (required)
+            CTF: Pre-computed CTF (optional). If provided, skips model inference.
+                Can be single sample [F, L] or batch [B, C, F, L]
+                
+        Returns:
+            RIR or list of RIRs depending on input shape
+        """
+        if CTF is None:
+            # Original path: run model to get CTF
+            if Obs_wav is None or model is None:
+                raise ValueError("Either CTF or (Obs_wav and model) must be provided")
+            CTF = self.init_seg(TF, model, Obs_wav)
+        
+        # Convert CTF to RIR (handles both single and batch)
+        return self.ctf_to_rir(CTF, TF, device)
 
     def apply_ramp(self, signal, left_ramp_sample=512, right_ramp_sample=512):
 
