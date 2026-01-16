@@ -15,6 +15,7 @@ import torchaudio
 from trainer_inferencer.utils import initialize_module
 from model.lossF import RIMag_loss, MSE_loss_complex
 import torch.nn.functional as F
+from estimate_T60_DRR import cal_T60, cal_DRR
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -23,86 +24,6 @@ warnings.filterwarnings("ignore")
 # ============================================================================
 # MultiResolution STFT Loss Classes (from Acoustic_Localization_one_mic)
 # ============================================================================
-
-def calculate_rt60(rir, sr=16000):
-    """
-    Calculate RT60 (Reverberation Time) from Room Impulse Response
-    
-    Args:
-        rir: Room impulse response tensor [T]
-        sr: Sample rate
-        
-    Returns:
-        RT60 value in seconds
-    """
-    # Convert to numpy for easier processing
-    if torch.is_tensor(rir):
-        rir = rir.cpu().numpy()
-    
-    # Ensure 1D
-    rir = np.squeeze(rir)
-    
-    # Calculate energy decay curve (EDC)
-    rir_squared = rir ** 2
-    edc = np.flip(np.cumsum(np.flip(rir_squared)))
-    
-    # Convert to dB
-    edc_db = 10 * np.log10(edc + 1e-12)
-    edc_db = edc_db - edc_db[0]  # Normalize to 0 dB at start
-    
-    # Find indices where energy drops by 5dB and 35dB
-    idx_5db = np.where(edc_db <= -5)[0][0]
-    idx_35db = np.where(edc_db <= -35)[0][0]
-    
-    # Linear regression on -5dB to -35dB range
-    time_5db = idx_5db / sr
-    time_35db = idx_35db / sr
-    
-    # Extrapolate to 60dB decay
-    decay_rate = -30 / (time_35db - time_5db)  # dB per second
-    rt60 = 60 / abs(decay_rate)
-    
-    return rt60
-
-
-
-def calculate_drr(rir, sr=16000, direct_window_ms=2.5):
-    """
-    Calculate DRR (Direct-to-Reverberant Ratio) from Room Impulse Response
-    
-    Args:
-        rir: Room impulse response tensor [T]
-        sr: Sample rate
-        direct_window_ms: Window size in ms for direct sound (default: 2.5ms)
-        
-    Returns:
-        DRR value in dB
-    """
-    # Convert to numpy for easier processing
-    if torch.is_tensor(rir):
-        rir = rir.cpu().numpy()
-    
-    # Ensure 1D
-    rir = np.squeeze(rir)
-    
-    # Find peak (direct sound)
-    peak_idx = np.argmax(np.abs(rir))
-    
-    # Calculate direct sound window
-    direct_samples = int(direct_window_ms * sr / 1000)
-    direct_start = max(0, peak_idx - direct_samples // 2)
-    direct_end = min(len(rir), peak_idx + direct_samples // 2)
-    
-    # Calculate energies
-    direct_energy = np.sum(rir[direct_start:direct_end] ** 2)
-    reverb_energy = np.sum(rir[direct_end:] ** 2)
-    
-    # Calculate DRR in dB
-    drr = 10 * np.log10((direct_energy + 1e-12) / (reverb_energy + 1e-12))
-    
-    return drr
-
-
 def stft(x, fft_size, hop_size, win_length, window):
     """Perform STFT and convert to magnitude spectrogram.
     Args:
@@ -312,6 +233,8 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     print("Model loaded successfully")
     
     # Setup dataloader (single GPU, no distributed)
+    # Force evaluation SNR to 20 dB without touching training configs
+    config["dataloader"]["args"]["snr_range"] = [20, 20]
     print("Loading validation dataset...")
     config["dataloader"]["args"].update({"rank": 0})
     config["dataloader"]["args"].update({"sr": config["acoustic"]["args"]["sr"]})
@@ -380,7 +303,7 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     pbar = tqdm(total=num_samples, desc="Evaluating", unit="sample")
     
     with torch.no_grad():
-        for index, (noisy_wav, rev_wav, dp_wav, fpath) in enumerate(valid_dataloader):
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in enumerate(valid_dataloader):
             if samples_evaluated >= num_samples:
                 break
             
@@ -432,26 +355,35 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
             )
             
             # ===== RIR Quality Evaluation using MRSTFT Loss =====
-            # Get RIR index (deterministic since shuffle=False for validation)
-            rir_idx = index % len(rir_pathlist)
-            rir_path = rir_pathlist[rir_idx]
+            # Use per-sample RIR path provided by dataset
             
             # Load ground truth RIR
             try:
-                # Check if it's .npz format (contains both rir and rir_dp)
-                if rir_path.endswith('.npz'):
-                    rir_dict = np.load(rir_path)
-                    gt_rir = torch.from_numpy(rir_dict["rir"][0]).float().to(device)
-                    # Normalize
-                    scale_rir = gt_rir.abs().max()
-                    if scale_rir > 0:
-                        gt_rir = gt_rir / scale_rir
+                if isinstance(rir_path, (list, tuple)):
+                    rir_paths = list(rir_path)
                 else:
-                    # Load from wav file
-                    gt_rir = transformfunc.load_wav(rir_path, transformfunc.sr).to(device)
-                    # Normalize
-                    if gt_rir.abs().max() > 0:
-                        gt_rir = gt_rir / gt_rir.abs().max()
+                    rir_paths = [rir_path] * batch_size
+
+                if len(rir_paths) != batch_size:
+                    rir_paths = (rir_paths * batch_size)[:batch_size]
+
+                gt_rirs = []
+                for rp in rir_paths:
+                    # Check if it's .npz format (contains both rir and rir_dp)
+                    if rp.endswith('.npz'):
+                        rir_dict = np.load(rp)
+                        gt_rir = torch.from_numpy(rir_dict["rir"][0]).float().to(device)
+                        # Normalize
+                        scale_rir = gt_rir.abs().max()
+                        if scale_rir > 0:
+                            gt_rir = gt_rir / scale_rir
+                    else:
+                        # Load from wav file
+                        gt_rir = transformfunc.load_wav(rp, transformfunc.sr).to(device)
+                        # Normalize
+                        if gt_rir.abs().max() > 0:
+                            gt_rir = gt_rir / gt_rir.abs().max()
+                    gt_rirs.append(gt_rir.flatten())
                 
                 # Estimate RIR from CTF using PIM sine sweep method
                 # Flip CTF as done in PIM.init_seg (line 71)
@@ -463,22 +395,24 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                 est_rirs = pim.ctf_to_rir(est_ctf_flipped, transformfunc, device, return_device=device)
                 
                 # Pad/truncate to same length for loss calculation
-                # Ensure gt_rir is 1D (flatten if needed)
-                gt_rir_1d = gt_rir.flatten()  # [T]
-                max_len = max(gt_rir_1d.shape[-1], max(r.shape[-1] for r in est_rirs))
-                gt_rir_padded = torch.nn.functional.pad(gt_rir_1d, (0, max_len - gt_rir_1d.shape[-1]))  # [T]
+                max_len = max(
+                    max(r.shape[-1] for r in est_rirs),
+                    max(r.shape[-1] for r in gt_rirs),
+                )
+                gt_rir_batch = torch.stack([
+                    torch.nn.functional.pad(r, (0, max_len - r.shape[-1]))
+                    for r in gt_rirs
+                ])  # [B, T]
                 est_rir_batch = torch.stack([
-                    torch.nn.functional.pad(r, (0, max_len - r.shape[-1])) 
+                    torch.nn.functional.pad(r, (0, max_len - r.shape[-1]))
                     for r in est_rirs
                 ])  # [B, T]
                 
                 # Calculate MultiResolution STFT Loss
                 # MRSTFT expects shape [B, 1, T]
-                # Expand gt_rir_padded to match batch size: [T] -> [B, 1, T]
-                gt_rir_batch = gt_rir_padded.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)  # [B, 1, T]
                 mrstft_result = mrstft_loss(
                     est_rir_batch.unsqueeze(1),  # [B, 1, T]
-                    gt_rir_batch  # [B, 1, T]
+                    gt_rir_batch.unsqueeze(1)  # [B, 1, T]
                 )
                 
                 # Accumulate MRSTFT losses
@@ -491,15 +425,23 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
                 for b in range(batch_size):
                     # Get estimated and ground truth RIRs
                     est_rir_sample = est_rirs[b]
-                    gt_rir_sample = gt_rir_1d
+                    gt_rir_sample = gt_rirs[b]
                     
-                    # Calculate RT60
-                    rt60_est = calculate_rt60(est_rir_sample, sr=transformfunc.sr)
-                    rt60_gt = calculate_rt60(gt_rir_sample, sr=transformfunc.sr)
+                    # Calculate RT60 using the original paper's implementation
+                    rt60_est = cal_T60(
+                        est_rir_sample.detach().cpu().numpy(),
+                        sr=transformfunc.sr,
+                        savepath=None,
+                    )
+                    rt60_gt = cal_T60(
+                        gt_rir_sample.detach().cpu().numpy(),
+                        sr=transformfunc.sr,
+                        savepath=None,
+                    )
                     
-                    # Calculate DRR
-                    drr_est = calculate_drr(est_rir_sample, sr=transformfunc.sr)
-                    drr_gt = calculate_drr(gt_rir_sample, sr=transformfunc.sr)
+                    # Calculate DRR using the original paper's implementation
+                    drr_est = cal_DRR(est_rir_sample.detach().cpu(), sr=transformfunc.sr)
+                    drr_gt = cal_DRR(gt_rir_sample.detach().cpu(), sr=transformfunc.sr)
                     
                     # Calculate errors (MAE and squared error for RMSE)
                     rt60_error = abs(rt60_est - rt60_gt)
@@ -570,6 +512,19 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     print(f"  DRR RMSE:     {avg_drr_rmse:.6f} dB")
     print(f"{'='*50}\n")
 
+    # CSV-friendly output for quick copy/paste into spreadsheets
+    print(
+        "csv,total_loss,clean_loss,reverb_loss,recon_loss,"
+        "mrstft_total,mrstft_sc,mrstft_mag,"
+        "rt60_mae_s,rt60_rmse_s,drr_mae_db,drr_rmse_db"
+    )
+    print(
+        "csv,"
+        f"{avg_loss_total:.6f},{avg_loss_cln:.6f},{avg_loss_rvb:.6f},{avg_loss_rec:.6f},"
+        f"{avg_mrstft_total:.6f},{avg_mrstft_sc:.6f},{avg_mrstft_mag:.6f},"
+        f"{avg_rt60_mae:.6f},{avg_rt60_rmse:.6f},{avg_drr_mae:.6f},{avg_drr_rmse:.6f}"
+    )
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="RecRIR Model Evaluation")
@@ -581,7 +536,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-k", "--checkpoint",
-        default="saved_dirpath/ckpt/best.tar",
+        default="saved_dirpath2/ckpt/best.tar",
         type=str,
         help="Path to model checkpoint (required)"
     )

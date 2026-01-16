@@ -57,7 +57,7 @@ class Trainer(BaseTrainer):
 
         loss_total = 0.0
         self.optimizer.zero_grad()
-        for index, (noisy_wav, rev_wav, dp_wav, fpath) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in (
             enumerate(tqdm(self.train_dataloader, desc="Training"))
             if self.rank == 0
             else enumerate(self.train_dataloader)
@@ -146,7 +146,7 @@ class Trainer(BaseTrainer):
         loss_total_rvb = 0.0
         loss_total_rec = 0.0
 
-        for index, (noisy_wav, rev_wav, dp_wav, fpath) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in (
             enumerate(tqdm(self.valid_dataloader, desc="Validating"))
             if self.rank == 0
             else enumerate(self.valid_dataloader)

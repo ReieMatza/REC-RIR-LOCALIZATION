@@ -266,7 +266,13 @@ class MyDataset(BaseDataset):
         noisy /= (scale + self.eps)
         
 
-        return noisy.unsqueeze(0), reverb.unsqueeze(0), target.unsqueeze(0), source_fpath
+        return (
+            noisy.unsqueeze(0),
+            reverb.unsqueeze(0),
+            target.unsqueeze(0),
+            source_fpath,
+            rir_this,
+        )
 
 
 class MyDataloader(DataLoader):
@@ -460,7 +466,7 @@ if __name__ == "__main__":
     count = 0
     for i in tqdm(range(dataset.__len__())):
 
-        reverb, target, filename = dataset.__getitem__((i, i))
+        noisy, reverb, target, filename, rir_path = dataset.__getitem__((i, i))
 
         if np.max(np.abs(reverb.numpy())) > 1:
             scale = np.max(np.abs(reverb.numpy())) + 1e-32
