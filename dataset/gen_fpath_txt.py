@@ -48,5 +48,8 @@ if __name__ == "__main__":
     main(**args)
 
     """
-    python gen_fpath_txt.py -i [dirpath] -o [saved .txt filepath] -e [extension]
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-w-localization/train -o /storage/reie/REC-RIR-LOCALIZATION/config/w-localization/reie-train-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-w-localization/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/w-localization/reie-validation-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-w-localization/test -o /storage/reie/REC-RIR-LOCALIZATION/config/w-localization/reie-test-rir.txt -e .npz
     """
+    
