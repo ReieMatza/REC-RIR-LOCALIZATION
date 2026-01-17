@@ -32,6 +32,16 @@ gpuRIR.activateMixedPrecision(False)
 gpuRIR.activateLUT(False)
 
 
+def compute_angle_radius(pos_src: np.ndarray, pos_rcv: np.ndarray) -> Tuple[float, float]:
+    src = np.array(pos_src)[0]
+    rcv = np.array(pos_rcv)
+    rcv_center = rcv.mean(axis=0)
+    delta = src - rcv_center
+    angle_deg = np.degrees(np.arctan2(delta[1], delta[0])) % 360.0
+    radius_m = float(np.linalg.norm(delta[:2]))
+    return angle_deg, radius_m
+
+
 def save_config_to_file(args, file_path):
     with open(file_path, "w") as json_file:
         json.dump(args.__dict__, json_file, indent=4)
@@ -689,7 +699,12 @@ def generate_rir_cfg_list(
 
 
 def generate_rir_files(
-    rir_cfg: Dict[str, Any], rir_dir: str, rir_nums: Tuple[int, int, int], use_gpu: bool
+    rir_cfg: Dict[str, Any],
+    rir_dir: str,
+    rir_nums: Tuple[int, int, int],
+    use_gpu: bool,
+    write_localization_csv: bool = True,
+    localization_csv_path: Optional[str] = None,
 ):
     train_rir_num, val_rir_num, test_rir_num = rir_nums
 
@@ -815,6 +830,26 @@ def generate_rir_files(
             pbar.update()
             __gen__(par=par, fs=fs, use_gpu=use_gpu)
 
+    if write_localization_csv:
+        if not localization_csv_path:
+            localization_csv_path = os.path.join(rir_dir, "rir_localization.csv")
+        rows = []
+        for par in pars:
+            index = par["index"]
+            if index < train_rir_num:
+                setdir = "train"
+            elif index >= train_rir_num and index < train_rir_num + val_rir_num:
+                setdir = "validation"
+            else:
+                setdir = "test"
+            rir_abs_path = os.path.join(rir_dir, setdir, f"{index}.npz")
+            angle_deg, radius_m = compute_angle_radius(par["pos_src"], par["pos_rcv"])
+            rows.append((rir_abs_path, angle_deg, radius_m))
+        with open(localization_csv_path, "w") as handle:
+            handle.write("rir_path,angle_deg,radius_m\n")
+            for rir_path, angle_deg, radius_m in rows:
+                handle.write(f"{rir_path},{angle_deg:.6f},{radius_m:.6f}\n")
+
 
 if __name__ == "__main__":
     # CUDA_VISIBLE_DEVICES=0 python generate_rirs.py --help
@@ -825,6 +860,18 @@ if __name__ == "__main__":
         generate_rir_cfg_list
     )  # add_argument for the function generate_rir_cfg_list
     parser.add_argument("--use_gpu", type=bool, default=True, help="use gpu or not")
+    parser.add_argument(
+        "--write_localization_csv",
+        type=bool,
+        default=True,
+        help="write CSV with rir_path/angle/radius metadata",
+    )
+    parser.add_argument(
+        "--localization_csv_path",
+        type=str,
+        default=None,
+        help="output CSV path (default: <rir_dir>/rir_localization.csv)",
+    )
     parser.add_argument(
         "-c", "--config", required=False, type=str, help="Configuration .json file"
     )
@@ -859,10 +906,13 @@ if __name__ == "__main__":
         rir_dir=args.rir_dir,
         rir_nums=args.rir_nums,
         use_gpu=args.use_gpu,
+        write_localization_csv=args.write_localization_csv,
+        localization_csv_path=args.localization_csv_path,
     )
 
 """
 usage:
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,20,20]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-w-localization  
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /mnt/inspurfs/home/wangpengyu/N-RKEM/v5/NeGI/data/sim_rir_final  
   python /mnt/c/Users/reiem/PythonProjects/Rec-RIR/dataset/gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,50, 50]' --fs 16000 --rir_dir /mnt/c/Users/reiem/PythonProjects/Rec-RIR/data/rirs
 """

@@ -8,6 +8,7 @@ import torchaudio
 from model.lossF import RIMag_loss, MSE_loss_complex
 from torch.amp import GradScaler, autocast
 import wandb
+import torch.nn as nn
 
 lossF_RIMag = RIMag_loss()
 lossF_MSE = MSE_loss_complex()
@@ -46,6 +47,9 @@ class Trainer(BaseTrainer):
         self.loss_w_rvb = config["trainer"]["train"]["loss_w_rvb"]
         self.loss_w_cln = config["trainer"]["train"]["loss_w_cln"]
         self.loss_w_rec = config["trainer"]["train"]["loss_w_rec"]
+        self.loss_w_angle = config["trainer"]["train"].get("loss_w_angle", 0.0)
+        self.loss_w_radius = config["trainer"]["train"].get("loss_w_radius", 0.0)
+        self.classification_loss = nn.CrossEntropyLoss()
 
         self.scaler = GradScaler()
         if config["trainer"]["train"]["loss_type"] == "RIMag":
@@ -57,7 +61,7 @@ class Trainer(BaseTrainer):
 
         loss_total = 0.0
         self.optimizer.zero_grad()
-        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class) in (
             enumerate(tqdm(self.train_dataloader, desc="Training"))
             if self.rank == 0
             else enumerate(self.train_dataloader)
@@ -67,6 +71,8 @@ class Trainer(BaseTrainer):
                 noisy_wav = noisy_wav.to(self.rank)
                 rev_wav = rev_wav.to(self.rank)
                 dp_wav = dp_wav.to(self.rank)
+                angle_class = angle_class.to(self.rank)
+                radius_class = radius_class.to(self.rank)
 
                 input_complex = self.transformfunc.stft(
                     noisy_wav, output_type="complex"
@@ -80,7 +86,13 @@ class Trainer(BaseTrainer):
 
                 input_ft = self.transformfunc.preprocess(input_complex)
 
-                est_spch_ft, est_ctf_ft, est_reverb_ft = self.compiled_model(input_ft)
+                (
+                    est_spch_ft,
+                    est_ctf_ft,
+                    est_reverb_ft,
+                    angle_logits,
+                    radius_logits,
+                ) = self.compiled_model(input_ft)
 
                 est_spch = self.transformfunc.postprocess(est_spch_ft).to(
                     dtype=torch.complex64
@@ -100,11 +112,27 @@ class Trainer(BaseTrainer):
                 loss_cln = self.lossF(est_spch, target_complex)
                 loss_rvb = self.lossF(est_reverb, reverb_complex)
                 loss_rec = self.lossF(recon, reverb_complex)
+                loss_angle = torch.tensor(0.0, device=self.rank)
+                loss_radius = torch.tensor(0.0, device=self.rank)
+                if self.loss_w_angle > 0:
+                    valid_angle = angle_class >= 0
+                    if valid_angle.any():
+                        loss_angle = self.classification_loss(
+                            angle_logits[valid_angle], angle_class[valid_angle]
+                        )
+                if self.loss_w_radius > 0:
+                    valid_radius = radius_class >= 0
+                    if valid_radius.any():
+                        loss_radius = self.classification_loss(
+                            radius_logits[valid_radius], radius_class[valid_radius]
+                        )
 
                 loss_gd = (
                     self.loss_w_cln * loss_cln
                     + self.loss_w_rec * loss_rec
                     + self.loss_w_rvb * loss_rvb
+                    + self.loss_w_angle * loss_angle
+                    + self.loss_w_radius * loss_radius
                 )
 
             self.scaler.scale(loss_gd).backward(retain_graph=True)
@@ -132,6 +160,8 @@ class Trainer(BaseTrainer):
                         "Train_step/loss_cln": loss_cln.item(),
                         "Train_step/loss_rvb": loss_rvb.item(),
                         "Train_step/loss_rec": loss_rec.item(),
+                        "Train_step/loss_angle": loss_angle.item(),
+                        "Train_step/loss_radius": loss_radius.item(),
                     }, step=self.steps)
 
         if self.rank == 0:
@@ -145,8 +175,10 @@ class Trainer(BaseTrainer):
         loss_total_cln = 0.0
         loss_total_rvb = 0.0
         loss_total_rec = 0.0
+        loss_total_angle = 0.0
+        loss_total_radius = 0.0
 
-        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class) in (
             enumerate(tqdm(self.valid_dataloader, desc="Validating"))
             if self.rank == 0
             else enumerate(self.valid_dataloader)
@@ -154,13 +186,21 @@ class Trainer(BaseTrainer):
             noisy_wav = noisy_wav.to(self.rank)
             rev_wav = rev_wav.to(self.rank)
             dp_wav = dp_wav.to(self.rank)
+            angle_class = angle_class.to(self.rank)
+            radius_class = radius_class.to(self.rank)
 
             input_complex = self.transformfunc.stft(noisy_wav, output_type="complex")
             target_complex = self.transformfunc.stft(dp_wav, output_type="complex")
             reverb_complex = self.transformfunc.stft(rev_wav, output_type="complex")
 
             input_ft = self.transformfunc.preprocess(input_complex)
-            est_spch_ft, est_ctf_ft, est_reverb_ft = self.model(input_ft)
+            (
+                est_spch_ft,
+                est_ctf_ft,
+                est_reverb_ft,
+                angle_logits,
+                radius_logits,
+            ) = self.model(input_ft)
 
             est_spch = self.transformfunc.postprocess(est_spch_ft)
             est_ctf = self.transformfunc.postprocess(est_ctf_ft)
@@ -175,28 +215,50 @@ class Trainer(BaseTrainer):
             loss_cln = self.lossF(est_spch, target_complex)
             loss_rvb = self.lossF(est_reverb, reverb_complex)
             loss_rec = self.lossF(recon, reverb_complex)
+            loss_angle = torch.tensor(0.0, device=self.rank)
+            loss_radius = torch.tensor(0.0, device=self.rank)
+            if self.loss_w_angle > 0:
+                valid_angle = angle_class >= 0
+                if valid_angle.any():
+                    loss_angle = self.classification_loss(
+                        angle_logits[valid_angle], angle_class[valid_angle]
+                    )
+            if self.loss_w_radius > 0:
+                valid_radius = radius_class >= 0
+                if valid_radius.any():
+                    loss_radius = self.classification_loss(
+                        radius_logits[valid_radius], radius_class[valid_radius]
+                    )
 
             loss = (
                 self.loss_w_cln * loss_cln
                 + self.loss_w_rec * loss_rec
                 + self.loss_w_rvb * loss_rvb
+                + self.loss_w_angle * loss_angle
+                + self.loss_w_radius * loss_radius
             )
 
             dist.all_reduce(loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_cln, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_rec, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_rvb, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_angle, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_radius, op=dist.ReduceOp.SUM)
 
             loss_total += loss
             loss_total_cln += loss_cln
             loss_total_rvb += loss_rvb
             loss_total_rec += loss_rec
+            loss_total_angle += loss_angle
+            loss_total_radius += loss_radius
             if self.rank == 0:
                 wandb.log({
                     "Valid_epoch/Loss": loss_total / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_cln": loss_total_cln / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rvb": loss_total_rvb / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rec": loss_total_rec / len(self.valid_dataloader) / dist.get_world_size(),
+                    "Valid_epoch/loss_angle": loss_total_angle / len(self.valid_dataloader) / dist.get_world_size(),
+                    "Valid_epoch/loss_radius": loss_total_radius / len(self.valid_dataloader) / dist.get_world_size(),
                 }, step=self.steps)
 
                 if index == 0:

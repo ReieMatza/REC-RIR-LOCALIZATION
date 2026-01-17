@@ -303,7 +303,15 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
     pbar = tqdm(total=num_samples, desc="Evaluating", unit="sample")
     
     with torch.no_grad():
-        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path) in enumerate(valid_dataloader):
+        for index, (
+            noisy_wav,
+            rev_wav,
+            dp_wav,
+            fpath,
+            rir_path,
+            _angle_class,
+            _radius_class,
+        ) in enumerate(valid_dataloader):
             if samples_evaluated >= num_samples:
                 break
             
@@ -331,7 +339,13 @@ def evaluate(config_path, checkpoint_path, num_samples, device):
             input_ft = transformfunc.preprocess(input_complex)
             
             # Forward pass
-            est_spch_ft, est_ctf_ft, est_reverb_ft = model(input_ft)
+            (
+                est_spch_ft,
+                est_ctf_ft,
+                est_reverb_ft,
+                _angle_logits,
+                _radius_logits,
+            ) = model(input_ft)
             
             # Postprocess model outputs
             est_spch = transformfunc.postprocess(est_spch_ft)

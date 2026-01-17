@@ -2,6 +2,7 @@
 # @email: wangpengyu@westlake.edu.cn
 # @description: code for dataset and dataloader.
 
+import csv
 import numpy as np
 from .base_dataset_torch import BaseDataset
 from .utils import MyDistributedSampler
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import torchaudio
 import torchaudio.functional as F
 
-from typing import List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union
 import random
 import soundfile as sf
 from pathlib import Path
@@ -31,6 +32,11 @@ class MyDataset(BaseDataset):
         shuffle: bool = False,
         noisy_proportion: float = 0.75,
         repeat=False,
+        localization_csv: Optional[str] = None,
+        localization_csv_columns: Tuple[str, str, str] = ("rir_path", "angle_deg", "radius_m"),
+        num_angles: int = 181,
+        max_rad_value: float = 6.0,
+        rad_resolution: float = 0.1,
         *args,
         **kwargs
     ) -> BaseDataset:
@@ -56,28 +62,64 @@ class MyDataset(BaseDataset):
         self.snr_range = snr_range
         self.noisy_proportion = noisy_proportion
         self.repeat = repeat
+        self.localization_csv = localization_csv
+        self.localization_csv_columns = localization_csv_columns
+        self.num_angles = num_angles
+        self.max_rad_value = max_rad_value
+        self.rad_resolution = rad_resolution
         # paths of the wavs
-        self.source_pathlist = [
-            line.rstrip("\n") for line in open(os.path.abspath(src_pathlist_txt), "r")
-        ]
+        self.source_pathlist = self._read_pathlist(src_pathlist_txt)
         self.source_pathlist = sorted(
             self.source_pathlist, key=lambda i: os.path.basename(i)
         )
-        self.rir_pathlist = [
-            line.rstrip("\n") for line in open(os.path.abspath(rir_pathlist_txt), "r")
-        ]
+        self.rir_pathlist = self._read_pathlist(rir_pathlist_txt)
         self.rir_pathlist = sorted(self.rir_pathlist, key=lambda i: os.path.basename(i))
-        self.noise_pathlist = [
-            line.rstrip("\n") for line in open(os.path.abspath(noise_pathlist_txt), "r")
-        ]
+        self.noise_pathlist = self._read_pathlist(noise_pathlist_txt)
         self.noise_pathlist = sorted(
             self.noise_pathlist, key=lambda i: os.path.basename(i)
         )
+
+        self.localization_map = self._load_localization_map(self.localization_csv)
 
         self.seq_len = seq_len
         # self.rir_type = rir_type
         self.shuffle = shuffle
         self.length = len(self.source_pathlist)
+
+    def _read_pathlist(self, pathlist_txt: str) -> List[str]:
+        with open(os.path.abspath(pathlist_txt), "r") as handle:
+            return [os.path.normpath(line.rstrip("\n")) for line in handle]
+
+    def _load_localization_map(self, csv_path: Optional[str]) -> Dict[str, Tuple[float, float]]:
+        if not csv_path:
+            return {}
+        rir_col, angle_col, radius_col = self.localization_csv_columns
+        localization_map: Dict[str, Tuple[float, float]] = {}
+        with open(os.path.abspath(csv_path), "r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                rir_path = os.path.normpath(row[rir_col])
+                localization_map[rir_path] = (
+                    float(row[angle_col]),
+                    float(row[radius_col]),
+                )
+        return localization_map
+
+    def _angle_to_class(self, angle_deg: float) -> int:
+        if self.num_angles <= 0:
+            return -1
+        angle_deg = angle_deg % 360.0
+        if self.num_angles <= 180:
+            angle_deg = min(angle_deg, 360.0 - angle_deg)
+        angle_idx = int(angle_deg)
+        return max(0, min(self.num_angles - 1, angle_idx))
+
+    def _radius_to_class(self, radius_m: float) -> int:
+        if self.rad_resolution <= 0:
+            return -1
+        num_rad = int(self.max_rad_value / self.rad_resolution) + 1
+        rad_idx = int(round(radius_m / self.rad_resolution))
+        return max(0, min(num_rad - 1, rad_idx))
 
     def gen_real_datapair(
         self, source: torch.Tensor, rir: torch.Tensor, dprir=None
@@ -214,6 +256,8 @@ class MyDataset(BaseDataset):
         else:
             rir_this = self.rir_pathlist[index % len(self.rir_pathlist)]
 
+        rir_key = os.path.normpath(rir_this)
+
         _, ext = os.path.splitext(rir_this)
         if ext == ".npz":
             rir_dict = np.load(rir_this)
@@ -266,12 +310,22 @@ class MyDataset(BaseDataset):
         noisy /= (scale + self.eps)
         
 
+        angle_class = -1
+        radius_class = -1
+        if self.localization_map:
+            if rir_key in self.localization_map:
+                angle_deg, radius_m = self.localization_map[rir_key]
+                angle_class = self._angle_to_class(angle_deg)
+                radius_class = self._radius_to_class(radius_m)
+
         return (
             noisy.unsqueeze(0),
             reverb.unsqueeze(0),
             target.unsqueeze(0),
             source_fpath,
             rir_this,
+            torch.tensor(angle_class, dtype=torch.long),
+            torch.tensor(radius_class, dtype=torch.long),
         )
 
 
@@ -287,6 +341,11 @@ class MyDataloader(DataLoader):
         batchsize: Tuple[int, int, int],
         sr: int,
         num_workers: int,
+        localization_csv: Optional[str] = None,
+        localization_csv_columns: Tuple[str, str, str] = ("rir_path", "angle_deg", "radius_m"),
+        num_angles: int = 181,
+        max_rad_value: float = 6.0,
+        rad_resolution: float = 0.1,
         seeds: Tuple[Union[int, None], Union[int, None], Union[int, None]] = [
             None,
             None,
@@ -329,6 +388,11 @@ class MyDataloader(DataLoader):
         self.seq_lenlist = seq_lenlist
         self.batchsize = batchsize
         self.sr = sr
+        self.localization_csv = localization_csv
+        self.localization_csv_columns = localization_csv_columns
+        self.num_angles = num_angles
+        self.max_rad_value = max_rad_value
+        self.rad_resolution = rad_resolution
         self.num_workers = num_workers
         self.seeds = []
         for seed in seeds:
@@ -364,6 +428,11 @@ class MyDataloader(DataLoader):
             rir_shuffle,
             self.noisy_proportion,
             repeat,
+            localization_csv=self.localization_csv,
+            localization_csv_columns=self.localization_csv_columns,
+            num_angles=self.num_angles,
+            max_rad_value=self.max_rad_value,
+            rad_resolution=self.rad_resolution,
         )
 
         return DataLoader(

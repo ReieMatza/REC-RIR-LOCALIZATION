@@ -370,6 +370,9 @@ class BiSpatialNet(nn.Module):
         num_layers_spch: int,
         num_layers_noise:int,
         num_layers_CTF: int,
+        num_angles: int = 181,
+        max_rad_value: float = 6.0,
+        rad_resolution: float = 0.1,
         encoder_kernel_size: int = 1,
         dropout: Tuple[float, float, float] = (0, 0, 0),
         kernel_size: Tuple[int, int] = (5, 3),
@@ -476,6 +479,18 @@ class BiSpatialNet(nn.Module):
             nn.Linear(in_features=dim_hidden, out_features=1),
             nn.Softmax(dim=2),
         )
+
+        num_rad_classes = int(max_rad_value / rad_resolution) + 1
+        self.angle_head = nn.Sequential(
+            nn.Linear(in_features=dim_hidden, out_features=512),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features=512, out_features=256),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features=256, out_features=num_angles),
+        )
+        self.radius_head = nn.Linear(in_features=dim_hidden, out_features=num_rad_classes)
         
 
     def forward(self, input: Tensor, return_embedding=False) -> Tensor:
@@ -515,10 +530,14 @@ class BiSpatialNet(nn.Module):
         
         if return_embedding:
             return x_CTF
+
+        ctf_embedding = x_CTF.mean(dim=1).squeeze(1)
+        angle_logits = self.angle_head(ctf_embedding)
+        radius_logits = self.radius_head(ctf_embedding)
         
         y_CTF = self.decoder_CTF(x_CTF).reshape([B, F, 2, -1]).permute(0, 2, 1, 3)
         
-        return y_spch,y_CTF,y_rev
+        return y_spch,y_CTF,y_rev,angle_logits,radius_logits
 
 if __name__ == "__main__":
     model = BiSpatialNet(
