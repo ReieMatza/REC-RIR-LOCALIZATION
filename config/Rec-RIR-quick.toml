@@ -40,7 +40,7 @@ hop_len = 256
 win_type = "sqrthann"
 
 [dataloader.args]
-src_pathlist = [ "config/reie_train_speech_dev.txt", "config/reie_validation_speech_dev.txt", "config/reie_validation_speech_dev.txt",]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
 rir_pathlist = [ "config/w-localization/reie-train-rir.txt", "config/w-localization/reie-validation-rir.txt", "config/w-localization/reie-validation-rir.txt",]
 noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
 localization_csv = "/storage/reie/data/rec-rir/rir-w-localization/rir_localization.csv"
