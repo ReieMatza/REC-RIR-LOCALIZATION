@@ -32,13 +32,35 @@ gpuRIR.activateMixedPrecision(False)
 gpuRIR.activateLUT(False)
 
 
-def compute_angle_radius(pos_src: np.ndarray, pos_rcv: np.ndarray) -> Tuple[float, float]:
+def compute_angle_radius(pos_src: np.ndarray, pos_rcv: np.ndarray, room_sz: Optional[List[float]] = None) -> Tuple[float, float]:
+    """
+    Compute angle and radius from microphone array center to source.
+    
+    Angle is measured in global room coordinates:
+    - 0° = positive x-axis
+    - 90° = positive y-axis
+    - 180° = negative x-axis
+    - 270° = negative y-axis
+    
+    If room_sz is provided (when using half-space restriction), angles > 180° are
+    reflected to [0, 180] range (e.g., 270° becomes 90°, 350° becomes 10°).
+    This gives an unsigned angular deviation, treating left and right symmetrically.
+    """
     src = np.array(pos_src)[0]
     rcv = np.array(pos_rcv)
     rcv_center = rcv.mean(axis=0)
     delta = src - rcv_center
-    angle_deg = np.degrees(np.arctan2(delta[1], delta[0])) % 360.0
     radius_m = float(np.linalg.norm(delta[:2]))
+    
+    # Compute angle in standard global coordinates [0, 360)
+    # 0° = +x, 90° = +y, 180° = -x, 270° = -y
+    angle_deg = np.degrees(np.arctan2(delta[1], delta[0])) % 360.0
+    
+    if room_sz is not None:
+        # Limit to [0, 180] by reflecting angles > 180
+        if angle_deg > 180.0:
+            angle_deg = 360.0 - angle_deg
+    
     return angle_deg, radius_m
 
 
@@ -469,7 +491,10 @@ def generate_rir_cfg_list(
     save_to: Union[Literal["auto"], str] = "auto",
     rir_dir: str = "dataset/rirs_generated",
     seed: int = 2024,
-    min_dist_to_wall: int = 1
+    min_dist_to_wall: int = 1,
+    mic_center: Optional[List[float]] = None,
+    restrict_src_to_inward_halfspace: bool = False,
+    max_src_tries: int = 1000,
 ):
     """configuration file generation
 
@@ -580,16 +605,82 @@ def generate_rir_cfg_list(
         np.savez_compressed(save_to, **cfg)
         return cfg
 
+    def _as_vec3(x, name: str) -> Optional[np.ndarray]:
+        if x is None:
+            return None
+        arr = np.array(x, dtype=np.float64).reshape(-1)
+        if arr.size != 3:
+            raise ValueError(f"{name} must have 3 elements, got {arr.size}: {x}")
+        return arr
+
+    def _required_mic_center_margin(array_extent_xy: float, mic_pos_var: float) -> float:
+        # We allow the array to be close to a wall, but it must remain inside the room.
+        # Use array_extent_xy (max XY distance from center to any mic) plus mic_pos_var.
+        return float(array_extent_xy + mic_pos_var)
+
+    def _is_mic_center_valid_for_room(mic_center: np.ndarray, room_sz: List[float], margin: float) -> bool:
+        # Enforce x/y wall clearance; mic_zlim handles z sampling constraints.
+        if mic_center is None:
+            return True
+        x, y, z = mic_center.tolist()
+        Lx, Ly, Lz = room_sz
+        if not (0.0 <= x <= Lx and 0.0 <= y <= Ly and 0.0 <= z <= Lz):
+            return False
+        if (x < margin) or (y < margin) or (x > Lx - margin) or (y > Ly - margin):
+            return False
+        return True
+
+    def _nearest_wall_halfspace(mic_center: np.ndarray, room_sz: List[float]):
+        # Returns a callable predicate f(pos)->bool implementing inward half-space constraint
+        x, y, _ = mic_center.tolist()
+        Lx, Ly, _ = room_sz
+        dists = {
+            "x0": x,
+            "xL": Lx - x,
+            "y0": y,
+            "yL": Ly - y,
+        }
+        wall = min(dists, key=dists.get)
+        if wall == "x0":
+            return wall, (lambda p: p[0] >= mic_center[0])
+        if wall == "xL":
+            return wall, (lambda p: p[0] <= mic_center[0])
+        if wall == "y0":
+            return wall, (lambda p: p[1] >= mic_center[1])
+        assert wall == "yL"
+        return wall, (lambda p: p[1] <= mic_center[1])
+
     # generate one room cfg
     np.random.seed(seed=seed + index)
     xlim, ylim, zlim = room_size_lims
 
     # sample radius / RT60 / room_sz / abs_weights
     array_r_this = uniform(*arr_radius)
+    mic_center = _as_vec3(mic_center, "mic_center")
+
+    # Determine array extent in XY (max distance from center to any mic), which is the key constraint
+    # for keeping a fixed mic array inside room boundaries.
+    if arr_geometry == "circular":
+        pos_rcv_local = circular_array_geometry(radius=array_r_this, mic_num=mic_num)
+    elif arr_geometry == "circular_with_center":
+        pos_rcv_local = circular_with_center_array_geometry(radius=array_r_this, mic_num=mic_num)
+    elif arr_geometry == "linear":
+        pos_rcv_local = linear_array_geometry(radius=array_r_this, mic_num=mic_num)
+    elif arr_geometry == "chime3":
+        pos_rcv_local = chime3_array_geometry()
+    else:
+        assert arr_geometry == "libricss", arr_geometry
+        pos_rcv_local = libricss_array_geometry()
+
+    array_extent_xy = float(np.max(norm(pos_rcv_local[:, :2], axis=-1))) if len(pos_rcv_local) > 0 else 0.0
+    req_margin = _required_mic_center_margin(array_extent_xy, mic_pos_var)
+
     RT60 = uniform(*RT60_lim)  # sample a RT60
     room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
-    # resample if the RT60 could not be satisfied in this room
-    while is_valid_RT60_for_room(room_sz, RT60) == False:  # or is_valid_beta(beta):
+    # resample if the RT60 could not be satisfied in this room OR fixed mic center cannot fit this array
+    while (is_valid_RT60_for_room(room_sz, RT60) == False) or (
+        mic_center is not None and (not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin))
+    ):
         room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]
         RT60 = uniform(*RT60_lim)
     # sample abs_weights then compute reflection coefficients
@@ -602,40 +693,42 @@ def generate_rir_cfg_list(
     #     warnings.warn(f'the given RT60={RT60} could not achieved with the given room_sz={room_sz} and abs_weights={abs_weights}')
 
     # microphone positions
-    mic_center = None
-    while (
-        mic_center is None
-        or mic_center[0] < 0.5
-        or mic_center[1] < 0.5
-        or mic_center[0] > room_sz[0] - 0.5
-        or mic_center[1] > room_sz[1] - 0.5
-    ):
-        mic_center = np.array(
-            [
-                uniform(
-                    max(min_dist_to_wall,room_sz[0] / 2 - arr_room_center_dist),
-                    min(room_sz[0]-min_dist_to_wall,room_sz[0] / 2 + arr_room_center_dist),
-                ),
-                uniform(
-                    max(min_dist_to_wall,room_sz[1] / 2 - arr_room_center_dist),
-                    min(room_sz[1]-min_dist_to_wall,room_sz[1] / 2 + arr_room_center_dist),
-                ),
-                uniform(*mic_zlim),
-            ]
-        )
-    if arr_geometry == "circular":
-        pos_rcv = circular_array_geometry(radius=array_r_this, mic_num=mic_num)
-    elif arr_geometry == "circular_with_center":
-        pos_rcv = circular_with_center_array_geometry(
-            radius=array_r_this, mic_num=mic_num
-        )
-    elif arr_geometry == "linear":
-        pos_rcv = linear_array_geometry(radius=array_r_this, mic_num=mic_num)
-    elif arr_geometry == "chime3":
-        pos_rcv = chime3_array_geometry()
+    if mic_center is None:
+        mic_center_tmp = None
+        while (
+            mic_center_tmp is None
+            or mic_center_tmp[0] < 0.5
+            or mic_center_tmp[1] < 0.5
+            or mic_center_tmp[0] > room_sz[0] - 0.5
+            or mic_center_tmp[1] > room_sz[1] - 0.5
+        ):
+            mic_center_tmp = np.array(
+                [
+                    uniform(
+                        max(min_dist_to_wall, room_sz[0] / 2 - arr_room_center_dist),
+                        min(
+                            room_sz[0] - min_dist_to_wall,
+                            room_sz[0] / 2 + arr_room_center_dist,
+                        ),
+                    ),
+                    uniform(
+                        max(min_dist_to_wall, room_sz[1] / 2 - arr_room_center_dist),
+                        min(
+                            room_sz[1] - min_dist_to_wall,
+                            room_sz[1] / 2 + arr_room_center_dist,
+                        ),
+                    ),
+                    uniform(*mic_zlim),
+                ]
+            )
+        mic_center = mic_center_tmp
     else:
-        assert arr_geometry == "libricss", arr_geometry
-        pos_rcv = libricss_array_geometry()
+        # Fixed mic center: still ensure z is within room bounds. We already enforced x/y margin above.
+        if not (0.0 <= mic_center[2] <= room_sz[2]):
+            raise ValueError(
+                f"mic_center z={mic_center[2]} is outside room z-range [0,{room_sz[2]}]."
+            )
+    pos_rcv = pos_rcv_local.copy()
 
     # rotate the array by x/y/z axis
     x_angle, y_angle, z_angle = [
@@ -655,24 +748,45 @@ def generate_rir_cfg_list(
     # sample speaker postions
     pos_src = np.empty((spk_num, 3))
     # all speaker's loc are randomly sampled
+    wall_pred = None
+    if restrict_src_to_inward_halfspace and mic_center is not None:
+        _, wall_pred = _nearest_wall_halfspace(mic_center=mic_center, room_sz=room_sz)
     for iiii in range(0, spk_num):
-        pos_src[iiii, :] = (
-            uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
-            uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
-            uniform(spk_zlim[0], spk_zlim[1]),
-        )
+        tries = 0
+        while True:
+            pos_src[iiii, :] = (
+                uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
+                uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
+                uniform(spk_zlim[0], spk_zlim[1]),
+            )
+            if wall_pred is not None and (not wall_pred(pos_src[iiii, :])):
+                tries += 1
+                if tries >= max_src_tries:
+                    raise RuntimeError(
+                        f"Failed to sample a source position satisfying inward-halfspace after {max_src_tries} tries. "
+                        f"Try increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
+                    )
+                continue
+            break
         if spk_arr_dist == "random":
             continue
         while (
             norm(pos_src[iiii, :] - mic_center) < spk_arr_dist[0]
             or norm(pos_src[iiii, :] - mic_center) > spk_arr_dist[1]
+            or (wall_pred is not None and (not wall_pred(pos_src[iiii, :])))
         ):
             # if the spk_mic_dis requirements are not satisfied, then resample a position
             pos_src[iiii, :] = (
-                uniform(0.5, room_sz[0] - 0.5),
-                uniform(0.5, room_sz[1] - 0.5),
+                uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
+                uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
                 uniform(spk_zlim[0], spk_zlim[1]),
             )
+            tries += 1
+            if tries >= max_src_tries:
+                raise RuntimeError(
+                    f"Failed to sample a source position satisfying constraints after {max_src_tries} tries. "
+                    f"Try loosening spk_arr_dist, increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
+                )
 
     # generate the positions of noise sources
     pos_noise = []
@@ -843,7 +957,7 @@ def generate_rir_files(
             else:
                 setdir = "test"
             rir_abs_path = os.path.join(rir_dir, setdir, f"{index}.npz")
-            angle_deg, radius_m = compute_angle_radius(par["pos_src"], par["pos_rcv"])
+            angle_deg, radius_m = compute_angle_radius(par["pos_src"], par["pos_rcv"], par["room_sz"])
             rows.append((rir_abs_path, angle_deg, radius_m))
         with open(localization_csv_path, "w") as handle:
             handle.write("rir_path,angle_deg,radius_m\n")
@@ -875,6 +989,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config", required=False, type=str, help="Configuration .json file"
     )
+    # NOTE: mic_center / restrict_src_to_inward_halfspace / max_src_tries are exposed via add_function_arguments(generate_rir_cfg_list)
     args = parser.parse_args()
     if args.config:
         with open(args.config, "r") as json_cfg:
@@ -912,7 +1027,10 @@ if __name__ == "__main__":
 
 """
 usage:
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,20,20]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-w-localization  
+ python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-w-localization  
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /mnt/inspurfs/home/wangpengyu/N-RKEM/v5/NeGI/data/sim_rir_final  
   python /mnt/c/Users/reiem/PythonProjects/Rec-RIR/dataset/gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,50, 50]' --fs 16000 --rir_dir /mnt/c/Users/reiem/PythonProjects/Rec-RIR/data/rirs
+
+ Fixed mic center near a wall + restrict sources to inward half-space (nearest wall):
+ python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --mic_center '[1.00,2.00,1.50]' --restrict_src_to_inward_halfspace true --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-mic
 """
