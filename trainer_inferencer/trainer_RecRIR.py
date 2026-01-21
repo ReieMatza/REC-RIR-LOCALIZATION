@@ -177,6 +177,10 @@ class Trainer(BaseTrainer):
         loss_total_rec = 0.0
         loss_total_angle = 0.0
         loss_total_radius = 0.0
+        error_total_angle = 0.0
+        error_total_radius = 0.0
+        num_valid_angle_samples = 0
+        num_valid_radius_samples = 0
 
         for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class) in (
             enumerate(tqdm(self.valid_dataloader, desc="Validating"))
@@ -217,18 +221,34 @@ class Trainer(BaseTrainer):
             loss_rec = self.lossF(recon, reverb_complex)
             loss_angle = torch.tensor(0.0, device=self.rank)
             loss_radius = torch.tensor(0.0, device=self.rank)
+            
+            # Calculate absolute errors
+            angle_error_batch = torch.tensor(0.0, device=self.rank)
+            radius_error_batch = torch.tensor(0.0, device=self.rank)
+            angle_count_batch = torch.tensor(0, device=self.rank, dtype=torch.int64)
+            radius_count_batch = torch.tensor(0, device=self.rank, dtype=torch.int64)
+            
             if self.loss_w_angle > 0:
                 valid_angle = angle_class >= 0
                 if valid_angle.any():
                     loss_angle = self.classification_loss(
                         angle_logits[valid_angle], angle_class[valid_angle]
                     )
+                    # Calculate absolute angle error
+                    angle_predictions = torch.argmax(angle_logits[valid_angle], dim=1)
+                    angle_error_batch = torch.abs(angle_predictions - angle_class[valid_angle]).float().sum()
+                    angle_count_batch = valid_angle.sum()
+                    
             if self.loss_w_radius > 0:
                 valid_radius = radius_class >= 0
                 if valid_radius.any():
                     loss_radius = self.classification_loss(
                         radius_logits[valid_radius], radius_class[valid_radius]
                     )
+                    # Calculate absolute radius error
+                    radius_predictions = torch.argmax(radius_logits[valid_radius], dim=1)
+                    radius_error_batch = torch.abs(radius_predictions - radius_class[valid_radius]).float().sum()
+                    radius_count_batch = valid_radius.sum()
 
             loss = (
                 self.loss_w_cln * loss_cln
@@ -244,6 +264,10 @@ class Trainer(BaseTrainer):
             dist.all_reduce(loss_rvb, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_angle, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_radius, op=dist.ReduceOp.SUM)
+            dist.all_reduce(angle_error_batch, op=dist.ReduceOp.SUM)
+            dist.all_reduce(radius_error_batch, op=dist.ReduceOp.SUM)
+            dist.all_reduce(angle_count_batch, op=dist.ReduceOp.SUM)
+            dist.all_reduce(radius_count_batch, op=dist.ReduceOp.SUM)
 
             loss_total += loss
             loss_total_cln += loss_cln
@@ -251,15 +275,31 @@ class Trainer(BaseTrainer):
             loss_total_rec += loss_rec
             loss_total_angle += loss_angle
             loss_total_radius += loss_radius
+            error_total_angle += angle_error_batch
+            error_total_radius += radius_error_batch
+            num_valid_angle_samples += angle_count_batch.item()
+            num_valid_radius_samples += radius_count_batch.item()
             if self.rank == 0:
-                wandb.log({
+                log_dict = {
                     "Valid_epoch/Loss": loss_total / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_cln": loss_total_cln / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rvb": loss_total_rvb / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_rec": loss_total_rec / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_angle": loss_total_angle / len(self.valid_dataloader) / dist.get_world_size(),
                     "Valid_epoch/loss_radius": loss_total_radius / len(self.valid_dataloader) / dist.get_world_size(),
-                }, step=self.steps)
+                }
+                
+                # Add absolute error metrics if we have valid samples
+                if num_valid_angle_samples > 0:
+                    log_dict["Valid_epoch/error_angle_abs_deg"] = (
+                        error_total_angle / num_valid_angle_samples
+                    ).item()
+                if num_valid_radius_samples > 0:
+                    log_dict["Valid_epoch/error_radius_abs_m"] = (
+                        error_total_radius / num_valid_radius_samples
+                    ).item()
+                
+                wandb.log(log_dict, step=self.steps)
 
                 if index == 0:
                     wandb.log({
