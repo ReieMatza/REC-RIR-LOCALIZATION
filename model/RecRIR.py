@@ -340,6 +340,26 @@ class SpatialNetLayer_nb(nn.Module):
         return f"full_share={self.full_share}"
 
 
+class FiLMConditioner(nn.Module):
+    """Produces gamma, beta for Feature-wise Linear Modulation: out = gamma * x + beta."""
+
+    def __init__(self, num_room_params: int, dim_hidden: int, hidden_mult: int = 2) -> None:
+        super().__init__()
+        hidden = num_room_params * hidden_mult
+        self.mlp = nn.Sequential(
+            nn.Linear(num_room_params, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, dim_hidden * 2),
+        )
+        self.dim_hidden = dim_hidden
+
+    def forward(self, room_params: Tensor) -> Tuple[Tensor, Tensor]:
+        """room_params: [B, num_params] -> gamma, beta: each [B, dim_hidden]"""
+        out = self.mlp(room_params)
+        gamma, beta = out.chunk(2, dim=-1)
+        return gamma, beta
+
+
 class FuseLayer(nn.Module):
     def __init__(
         self,
@@ -381,6 +401,9 @@ class BiSpatialNet(nn.Module):
         padding: str = "zeros",
         full_share: int = 0,  # share from layer 0
         attention: str = "mhsa(251)",  # mhsa(frames), ret(factor)
+        use_film: bool = False,
+        num_room_params: int = 7,
+        use_variance_in_embedding: bool = False,
     ):
         super().__init__()
 
@@ -480,9 +503,12 @@ class BiSpatialNet(nn.Module):
             nn.Softmax(dim=2),
         )
 
+        self.use_variance_in_embedding = use_variance_in_embedding
+        dim_embedding = 2 * dim_hidden if use_variance_in_embedding else dim_hidden
+
         num_rad_classes = int(max_rad_value / rad_resolution) + 1
         self.angle_head = nn.Sequential(
-            nn.Linear(in_features=dim_hidden, out_features=512),
+            nn.Linear(in_features=dim_embedding, out_features=512),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(in_features=512, out_features=256),
@@ -490,10 +516,17 @@ class BiSpatialNet(nn.Module):
             nn.Dropout(p=0.2),
             nn.Linear(in_features=256, out_features=num_angles),
         )
-        self.radius_head = nn.Linear(in_features=dim_hidden, out_features=num_rad_classes)
-        
+        self.radius_head = nn.Linear(in_features=dim_embedding, out_features=num_rad_classes)
 
-    def forward(self, input: Tensor, return_embedding=False) -> Tensor:
+        self.use_film = use_film
+        if use_film:
+            self.film_conditioner = FiLMConditioner(num_room_params, dim_embedding)
+        else:
+            self.film_conditioner = None
+
+    def forward(
+        self, input: Tensor, return_embedding: bool = False, room_params: Optional[Tensor] = None
+    ) -> Tensor:
 
         input_pad = torch.nn.functional.pad(
             input,
@@ -526,12 +559,22 @@ class BiSpatialNet(nn.Module):
         for i, m in enumerate(self.ctf_layers):
             x = m(x)
 
-        x_CTF = (x * self.weight_layer(x)).sum(-2).unsqueeze(2)
+        # x: [B, F, T, H] -> weight_layer(x): [B, F, T, 1] -> (x * weight).sum(-2): [B, F, H] -> unsqueeze(2): [B, F, 1, H]
+        x_CTF = (x * self.weight_layer(x)).sum(-2).unsqueeze(2)  # [B, F, 1, H] = [B, F, 1, dim_hidden]
         
         if return_embedding:
             return x_CTF
 
-        ctf_embedding = x_CTF.mean(dim=1).squeeze(1)
+        # x_CTF: [B, F, 1, H] -> mean/std over F -> ctf_embedding: [B, 1, H] or [B, 1, 2*H]
+        if self.use_variance_in_embedding:
+            ctf_mean = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
+            ctf_std = x_CTF.std(dim=1).squeeze(1)  # [B, 1, H]
+            ctf_embedding = torch.cat([ctf_mean, ctf_std], dim=-1)  # [B, 1, 2*H]
+        else:
+            ctf_embedding = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
+        if self.use_film and self.film_conditioner is not None and room_params is not None:
+            gamma, beta = self.film_conditioner(room_params)
+            ctf_embedding = gamma * ctf_embedding + beta
         angle_logits = self.angle_head(ctf_embedding)
         radius_logits = self.radius_head(ctf_embedding)
         

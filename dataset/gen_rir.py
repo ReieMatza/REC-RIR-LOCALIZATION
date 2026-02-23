@@ -457,6 +457,7 @@ def generate_rir_cfg_list(
     room_size_lims: Tuple[
         Tuple[float, float], Tuple[float, float], Tuple[float, float]
     ] = ((3, 8), (3, 8), (3, 5)),
+    room_size_list: Optional[List[List[float]]] = None,
     mic_zlim: Tuple[float, float] = (1.0, 2),
     spk_zlim: Tuple[float, float] = (1.0, 2),
     RT60_lim: Tuple[float, float] = (0.1, 1.0),
@@ -493,6 +494,7 @@ def generate_rir_cfg_list(
     seed: int = 2024,
     min_dist_to_wall: int = 1,
     mic_center: Optional[List[float]] = None,
+    mic_center_list: Optional[List[List[float]]] = None,
     restrict_src_to_inward_halfspace: bool = False,
     max_src_tries: int = 1000,
 ):
@@ -503,6 +505,7 @@ def generate_rir_cfg_list(
         spk_num: the number of speakers.
         noise_num: the number of point noises.
         room_size_lims: the x, y, z range of room.
+        room_size_list: fixed room sizes to cycle through evenly (each item must have a mic_center_list entry).
         mic_zlim: the z range of microphone center.
         spk_zlim: the height range of speaker.
         RT60_lim: the range of RT60.
@@ -520,7 +523,63 @@ def generate_rir_cfg_list(
         save_to: save the configuration file to.
         rir_dir: the dir to save generated rirs
         seed: the random seeds.
+        mic_center_list: fixed mic centers aligned with room_size_list.
     """
+    def _as_vec3(x, name: str) -> Optional[np.ndarray]:
+        if x is None:
+            return None
+        arr = np.array(x, dtype=np.float64).reshape(-1)
+        if arr.size != 3:
+            raise ValueError(f"{name} must have 3 elements, got {arr.size}: {x}")
+        return arr
+
+    def _as_vec3_list(xs, name: str) -> Optional[List[np.ndarray]]:
+        if xs is None:
+            return None
+        if not isinstance(xs, (list, tuple)) or len(xs) == 0:
+            raise ValueError(f"{name} must be a non-empty list of 3-element lists.")
+        out = []
+        for i, x in enumerate(xs):
+            out.append(_as_vec3(x, f"{name}[{i}]"))
+        return out
+
+    def _required_mic_center_margin(array_extent_xy: float, mic_pos_var: float) -> float:
+        # We allow the array to be close to a wall, but it must remain inside the room.
+        # Use array_extent_xy (max XY distance from center to any mic) plus mic_pos_var.
+        return float(array_extent_xy + mic_pos_var)
+
+    def _is_mic_center_valid_for_room(mic_center: np.ndarray, room_sz: List[float], margin: float) -> bool:
+        # Enforce x/y wall clearance; mic_zlim handles z sampling constraints.
+        if mic_center is None:
+            return True
+        x, y, z = mic_center.tolist()
+        Lx, Ly, Lz = room_sz
+        if not (0.0 <= x <= Lx and 0.0 <= y <= Ly and 0.0 <= z <= Lz):
+            return False
+        if (x < margin) or (y < margin) or (x > Lx - margin) or (y > Ly - margin):
+            return False
+        return True
+
+    def _nearest_wall_halfspace(mic_center: np.ndarray, room_sz: List[float]):
+        # Returns a callable predicate f(pos)->bool implementing inward half-space constraint
+        x, y, _ = mic_center.tolist()
+        Lx, Ly, _ = room_sz
+        dists = {
+            "x0": x,
+            "xL": Lx - x,
+            "y0": y,
+            "yL": Ly - y,
+        }
+        wall = min(dists, key=dists.get)
+        if wall == "x0":
+            return wall, (lambda p: p[0] >= mic_center[0])
+        if wall == "xL":
+            return wall, (lambda p: p[0] <= mic_center[0])
+        if wall == "y0":
+            return wall, (lambda p: p[1] >= mic_center[1])
+        assert wall == "yL"
+        return wall, (lambda p: p[1] <= mic_center[1])
+
     if index is None:
         # set parameters and start multiprocessing generation
         assert arr_geometry in [
@@ -569,9 +628,23 @@ def generate_rir_cfg_list(
             ), "you should give the weights of six walls"
         if save_to == "auto":
             save_to = os.path.join(rir_dir, "rir_cfg.npz")
+        # capture only actual configuration parameters (avoid local callables for pickling)
         args = (
             locals().copy()
-        )  # capture the parameters passed to this function or their edited values
+        )  # start from locals, then drop helpers/callables
+        for _k in list(args.keys()):
+            if callable(args[_k]) or _k.startswith("_"):
+                del args[_k]
+
+        if room_size_list is not None:
+            room_size_list_checked = _as_vec3_list(room_size_list, "room_size_list")
+            mic_center_list_checked = _as_vec3_list(mic_center_list, "mic_center_list")
+            if mic_center_list_checked is None:
+                raise ValueError("mic_center_list must be provided when room_size_list is set.")
+            if len(room_size_list_checked) != len(mic_center_list_checked):
+                raise ValueError(
+                    f"room_size_list length {len(room_size_list_checked)} must match mic_center_list length {len(mic_center_list_checked)}."
+                )
 
         if os.path.exists(save_to):
             cfg = dict(np.load(save_to, allow_pickle=True))
@@ -605,51 +678,6 @@ def generate_rir_cfg_list(
         np.savez_compressed(save_to, **cfg)
         return cfg
 
-    def _as_vec3(x, name: str) -> Optional[np.ndarray]:
-        if x is None:
-            return None
-        arr = np.array(x, dtype=np.float64).reshape(-1)
-        if arr.size != 3:
-            raise ValueError(f"{name} must have 3 elements, got {arr.size}: {x}")
-        return arr
-
-    def _required_mic_center_margin(array_extent_xy: float, mic_pos_var: float) -> float:
-        # We allow the array to be close to a wall, but it must remain inside the room.
-        # Use array_extent_xy (max XY distance from center to any mic) plus mic_pos_var.
-        return float(array_extent_xy + mic_pos_var)
-
-    def _is_mic_center_valid_for_room(mic_center: np.ndarray, room_sz: List[float], margin: float) -> bool:
-        # Enforce x/y wall clearance; mic_zlim handles z sampling constraints.
-        if mic_center is None:
-            return True
-        x, y, z = mic_center.tolist()
-        Lx, Ly, Lz = room_sz
-        if not (0.0 <= x <= Lx and 0.0 <= y <= Ly and 0.0 <= z <= Lz):
-            return False
-        if (x < margin) or (y < margin) or (x > Lx - margin) or (y > Ly - margin):
-            return False
-        return True
-
-    def _nearest_wall_halfspace(mic_center: np.ndarray, room_sz: List[float]):
-        # Returns a callable predicate f(pos)->bool implementing inward half-space constraint
-        x, y, _ = mic_center.tolist()
-        Lx, Ly, _ = room_sz
-        dists = {
-            "x0": x,
-            "xL": Lx - x,
-            "y0": y,
-            "yL": Ly - y,
-        }
-        wall = min(dists, key=dists.get)
-        if wall == "x0":
-            return wall, (lambda p: p[0] >= mic_center[0])
-        if wall == "xL":
-            return wall, (lambda p: p[0] <= mic_center[0])
-        if wall == "y0":
-            return wall, (lambda p: p[1] >= mic_center[1])
-        assert wall == "yL"
-        return wall, (lambda p: p[1] <= mic_center[1])
-
     # generate one room cfg
     np.random.seed(seed=seed + index)
     xlim, ylim, zlim = room_size_lims
@@ -657,6 +685,8 @@ def generate_rir_cfg_list(
     # sample radius / RT60 / room_sz / abs_weights
     array_r_this = uniform(*arr_radius)
     mic_center = _as_vec3(mic_center, "mic_center")
+    room_size_list = _as_vec3_list(room_size_list, "room_size_list")
+    mic_center_list = _as_vec3_list(mic_center_list, "mic_center_list")
 
     # Determine array extent in XY (max distance from center to any mic), which is the key constraint
     # for keeping a fixed mic array inside room boundaries.
@@ -675,14 +705,33 @@ def generate_rir_cfg_list(
     array_extent_xy = float(np.max(norm(pos_rcv_local[:, :2], axis=-1))) if len(pos_rcv_local) > 0 else 0.0
     req_margin = _required_mic_center_margin(array_extent_xy, mic_pos_var)
 
-    RT60 = uniform(*RT60_lim)  # sample a RT60
-    room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
-    # resample if the RT60 could not be satisfied in this room OR fixed mic center cannot fit this array
-    while (is_valid_RT60_for_room(room_sz, RT60) == False) or (
-        mic_center is not None and (not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin))
-    ):
-        room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]
+    if room_size_list is not None:
+        if mic_center_list is None:
+            raise ValueError("mic_center_list must be provided when room_size_list is set.")
+        if len(room_size_list) != len(mic_center_list):
+            raise ValueError(
+                f"room_size_list length {len(room_size_list)} must match mic_center_list length {len(mic_center_list)}."
+            )
+        list_idx = index % len(room_size_list)
+        room_sz = room_size_list[list_idx].tolist()
+        mic_center = mic_center_list[list_idx]
+        if not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin):
+            raise ValueError(
+                f"mic_center_list[{list_idx}]={mic_center.tolist()} does not fit room_size_list[{list_idx}]={room_sz} "
+                f"with margin={req_margin:.3f}."
+            )
         RT60 = uniform(*RT60_lim)
+        while is_valid_RT60_for_room(room_sz, RT60) == False:
+            RT60 = uniform(*RT60_lim)
+    else:
+        RT60 = uniform(*RT60_lim)  # sample a RT60
+        room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
+        # resample if the RT60 could not be satisfied in this room OR fixed mic center cannot fit this array
+        while (is_valid_RT60_for_room(room_sz, RT60) == False) or (
+            mic_center is not None and (not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin))
+        ):
+            room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]
+            RT60 = uniform(*RT60_lim)
     # sample abs_weights then compute reflection coefficients
     abs_weights = [uniform(*abs_lim) for abs_lim in wall_abs_weights_lims]
     beta, t60error = beta_SabineEstimation(room_sz, RT60, abs_weights=abs_weights)
@@ -1033,4 +1082,7 @@ usage:
 
  Fixed mic center near a wall + restrict sources to inward half-space (nearest wall):
  python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --mic_center '[1.00,2.00,1.50]' --restrict_src_to_inward_halfspace true --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-mic
+
+ Fixed room size list + matching mic centers (evenly distributed by index):
+ python gen_rir.py --room_size_list '[[5,6,3],[6,7,3],[8,5,3]]' --mic_center_list '[[2.00,1.00,2.0],[2.00,1.00,2.0],[2.00,1.00,2.0]]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-room-list
 """

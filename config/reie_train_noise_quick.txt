@@ -1,0 +1,3 @@
+/storage/reie/data/rec-rir/noise/NoiseX-92/m109.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/buccaneer1.wav
+/storage/reie/data/rec-rir/noise/NoiseX-92/babble.wav

@@ -1,3 +1,13 @@
+# Config for training only the localization heads (angle_head, radius_head)
+# with the backbone frozen from a pretrained checkpoint.
+#
+# Usage:
+#   torchrun --standalone --nnodes=1 --nproc_per_node=1 train.py \
+#     -c /storage/reie/REC-RIR-LOCALIZATION/config/Rec-RIR-heads-only.toml \
+#     -p /storage/reie/experiments/heads-only-film-variance \
+#     -s /storage/reie/REC-RIR-LOCALIZATION/ckpt/epoch35.tar \
+#     --freeze-backbone
+
 [meta]
 seed = 2024
 cudnn_enable = true
@@ -7,8 +17,8 @@ use_torch_compile = false  # Set to false to reduce memory usage
 project = "rec-rir-localization"
 entity = ""  # WandB team/entity (optional, leave empty for personal account)
 name = ""  # Run name (optional, will auto-generate if empty)
-tags = ["training", "rec-rir"]
-notes = ""
+tags = ["training", "rec-rir", "heads-only"]
+notes = "Three rooms, valiant-paper-14 backbone, Training only angle_head and radius_head with frozen backbone"
 mode = "online"  # "online", "offline", or "disabled"
 
 [acoustic]
@@ -40,7 +50,7 @@ hop_len = 256
 win_type = "sqrthann"
 
 [dataloader.args]
-src_pathlist = [ "config/reie_train_speech_dev.txt", "config/reie_validation_speech_dev.txt", "config/reie_validation_speech_dev.txt",]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
 rir_pathlist = [ "config/rir-fixed-room-list/reie-train-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt",]
 noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
 localization_csv = "/storage/reie/data/rec-rir/rir-fixed-room-list/rir_localization.csv"
@@ -59,20 +69,21 @@ persistent_workers = true
 rank = 0
 sr = 16000
 noisy_proportion = 1
+use_room_conditioning = true
 
 [optimizer.args]
-lr = 0.001
+lr = 0.0005  # Lower LR for fine-tuning heads only
 
 [scheduler.args]
 T_0 = 24272 # depend on the samples in one epoch
 
 [trainer.train]
-epochs = 100
+epochs = 50
 clip_grad_norm_value = 1
 save_ckpt_interval = 1
-loss_w_cln = 1
-loss_w_rvb = 1
-loss_w_rec = 1
+loss_w_cln = 0    # Backbone frozen, no need for speech loss
+loss_w_rvb = 0    # Backbone frozen, no need for reverb loss
+loss_w_rec = 0    # Backbone frozen, no need for reconstruction loss
 loss_w_angle = 1.0
 loss_w_radius = 1.0
 loss_type = "RIMag"
@@ -101,6 +112,9 @@ conv_groups = [ 8, 8,]
 norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
 full_share = 0
 attention = "mamba(16,4)"
+use_film = true
+num_room_params = 7
+use_variance_in_embedding = true  # Concatenate mean and std over frequency for localization heads
 
 [EM_algo.args]
 sr = 16000

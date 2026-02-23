@@ -65,13 +65,13 @@ def main():
     parser.add_argument(
         '--sample-ratio',
         type=float,
-        default=0.05,
+        default=0.25,
         help='Fraction of lines to sample (default: 0.05 = 5%%)'
     )
     parser.add_argument(
         '--suffix',
         type=str,
-        default='_dev',
+        default='_quick',
         help='Suffix to add to output filenames (default: _dev)'
     )
     parser.add_argument(
@@ -89,12 +89,12 @@ def main():
     
     # List of dataset files to process
     dataset_files = [
-        'reie_train_rirs.txt',
-        'reie_valid_rirs.txt',
-        'reie_train_spch.txt',
-        'reie_valid_spch.txt',
+        'reie_train_rir.txt',
+        'reie_validation_rir.txt',
+        'reie_train_speech.txt',
+        'reie_validation_speech.txt',
         'reie_train_noise.txt',
-        'reie_valid_noise.txt',
+        'reie_validation_noise.txt',
     ]
     
     print(f"Creating development datasets ({args.sample_ratio*100:.1f}% of original size)...")

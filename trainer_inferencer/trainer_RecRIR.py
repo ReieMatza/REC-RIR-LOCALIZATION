@@ -61,7 +61,7 @@ class Trainer(BaseTrainer):
 
         loss_total = 0.0
         self.optimizer.zero_grad()
-        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class, room_params) in (
             enumerate(tqdm(self.train_dataloader, desc="Training"))
             if self.rank == 0
             else enumerate(self.train_dataloader)
@@ -73,6 +73,7 @@ class Trainer(BaseTrainer):
                 dp_wav = dp_wav.to(self.rank)
                 angle_class = angle_class.to(self.rank)
                 radius_class = radius_class.to(self.rank)
+                room_params = room_params.to(self.rank) if room_params is not None else None
 
                 input_complex = self.transformfunc.stft(
                     noisy_wav, output_type="complex"
@@ -92,7 +93,7 @@ class Trainer(BaseTrainer):
                     est_reverb_ft,
                     angle_logits,
                     radius_logits,
-                ) = self.compiled_model(input_ft)
+                ) = self.compiled_model(input_ft, room_params=room_params)
 
                 est_spch = self.transformfunc.postprocess(est_spch_ft).to(
                     dtype=torch.complex64
@@ -182,7 +183,7 @@ class Trainer(BaseTrainer):
         num_valid_angle_samples = 0
         num_valid_radius_samples = 0
 
-        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class) in (
+        for index, (noisy_wav, rev_wav, dp_wav, fpath, rir_path, angle_class, radius_class, room_params) in (
             enumerate(tqdm(self.valid_dataloader, desc="Validating"))
             if self.rank == 0
             else enumerate(self.valid_dataloader)
@@ -192,6 +193,7 @@ class Trainer(BaseTrainer):
             dp_wav = dp_wav.to(self.rank)
             angle_class = angle_class.to(self.rank)
             radius_class = radius_class.to(self.rank)
+            room_params = room_params.to(self.rank) if room_params is not None else None
 
             input_complex = self.transformfunc.stft(noisy_wav, output_type="complex")
             target_complex = self.transformfunc.stft(dp_wav, output_type="complex")
@@ -204,7 +206,7 @@ class Trainer(BaseTrainer):
                 est_reverb_ft,
                 angle_logits,
                 radius_logits,
-            ) = self.model(input_ft)
+            ) = self.model(input_ft, room_params=room_params)
 
             est_spch = self.transformfunc.postprocess(est_spch_ft)
             est_ctf = self.transformfunc.postprocess(est_ctf_ft)

@@ -41,11 +41,11 @@ win_type = "sqrthann"
 
 [dataloader.args]
 src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
-rir_pathlist = [ "config/w-localization/reie-train-rir.txt", "config/w-localization/reie-validation-rir.txt", "config/w-localization/reie-validation-rir.txt",]
+rir_pathlist = [ "config/rir-fixed-room-list/reie-train-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt",]
 noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
-localization_csv = "/storage/reie/data/rec-rir/rir-w-localization/rir_localization.csv"
+localization_csv = "/storage/reie/data/rec-rir/rir-fixed-room-list/rir_localization.csv"
 localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
-num_angles = 360
+num_angles = 181
 max_rad_value = 3.0
 rad_resolution = 0.1
 snr_range = [ 5, 20,]
@@ -91,7 +91,7 @@ num_freqs = 257
 num_layers_spch = 6
 num_layers_noise = 2
 num_layers_CTF = 6
-num_angles = 360
+num_angles = 181
 max_rad_value = 3.0
 rad_resolution = 0.1
 encoder_kernel_size = 5

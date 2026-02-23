@@ -37,6 +37,7 @@ class MyDataset(BaseDataset):
         num_angles: int = 181,
         max_rad_value: float = 6.0,
         rad_resolution: float = 0.1,
+        use_room_conditioning: bool = False,
         *args,
         **kwargs
     ) -> BaseDataset:
@@ -67,6 +68,10 @@ class MyDataset(BaseDataset):
         self.num_angles = num_angles
         self.max_rad_value = max_rad_value
         self.rad_resolution = rad_resolution
+        self.use_room_conditioning = use_room_conditioning
+        # Fixed normalization ranges for room params (RT60 [0.1,1.5], room_sz max 15m, mic_center by room_sz)
+        self._rt60_min, self._rt60_max = 0.1, 1.5
+        self._room_sz_max = 15.0
         # paths of the wavs
         self.source_pathlist = self._read_pathlist(src_pathlist_txt)
         self.source_pathlist = sorted(
@@ -120,6 +125,37 @@ class MyDataset(BaseDataset):
         num_rad = int(self.max_rad_value / self.rad_resolution) + 1
         rad_idx = int(round(radius_m / self.rad_resolution))
         return max(0, min(num_rad - 1, rad_idx))
+
+    NUM_ROOM_PARAMS = 7  # RT60(1) + room_sz(3) + mic_center(3)
+
+    def _extract_room_params(self, rir_dict: np.lib.npyio.NpzFile) -> Optional[torch.Tensor]:
+        """Extract and normalize room params from npz: RT60(1) + room_sz(3) + mic_center(3) = 7 scalars."""
+        if not self.use_room_conditioning:
+            return None
+        try:
+            RT60 = float(np.asarray(rir_dict["RT60"]).ravel()[0])
+            room_sz = np.asarray(rir_dict["room_sz"]).ravel()
+            if room_sz.size >= 3:
+                room_sz = room_sz[:3].astype(np.float64)
+            else:
+                return None
+            pos_rcv = np.asarray(rir_dict["pos_rcv"])
+            if pos_rcv.ndim == 1:
+                pos_rcv = pos_rcv.reshape(-1, 3)
+            mic_center = pos_rcv.mean(axis=0).astype(np.float64)
+            # Normalize: RT60 to [0,1], room_sz by max 15m, mic_center by room_sz to [0,1]
+            rt60_norm = np.clip(
+                (RT60 - self._rt60_min) / (self._rt60_max - self._rt60_min), 0.0, 1.0
+            )
+            room_sz_norm = np.clip(room_sz / self._room_sz_max, 0.0, 1.0)
+            eps = 1e-8
+            mic_center_norm = np.clip(mic_center / (room_sz + eps), 0.0, 1.0)
+            room_params = np.concatenate(
+                [[rt60_norm], room_sz_norm, mic_center_norm]
+            ).astype(np.float32)
+            return torch.from_numpy(room_params)
+        except (KeyError, ValueError, IndexError):
+            return None
 
     def gen_real_datapair(
         self, source: torch.Tensor, rir: torch.Tensor, dprir=None
@@ -258,12 +294,17 @@ class MyDataset(BaseDataset):
 
         rir_key = os.path.normpath(rir_this)
 
+        room_params = torch.zeros(self.NUM_ROOM_PARAMS, dtype=torch.float32)
         _, ext = os.path.splitext(rir_this)
         if ext == ".npz":
             rir_dict = np.load(rir_this)
             sr_rir = rir_dict["fs"]
             rir = torch.Tensor(rir_dict["rir"][0])
             dprir = torch.Tensor(rir_dict["rir_dp"][0])
+            if self.use_room_conditioning:
+                extracted = self._extract_room_params(rir_dict)
+                if extracted is not None:
+                    room_params = extracted
             scale_rir = rir.abs().max()
             rir /= scale_rir
             dprir /= scale_rir
@@ -326,6 +367,7 @@ class MyDataset(BaseDataset):
             rir_this,
             torch.tensor(angle_class, dtype=torch.long),
             torch.tensor(radius_class, dtype=torch.long),
+            room_params,
         )
 
 
@@ -356,6 +398,7 @@ class MyDataloader(DataLoader):
         persistent_workers: Union[None, bool] = None,
         rank: int = 0,
         noisy_proportion: float = 0.75,
+        use_room_conditioning: bool = False,
         *args,
         **kwargs
     ) -> DataLoader:
@@ -394,6 +437,7 @@ class MyDataloader(DataLoader):
         self.max_rad_value = max_rad_value
         self.rad_resolution = rad_resolution
         self.num_workers = num_workers
+        self.use_room_conditioning = use_room_conditioning
         self.seeds = []
         for seed in seeds:
             self.seeds.append(seed if seed is not None else random.randint(0, 1000000))
@@ -433,6 +477,7 @@ class MyDataloader(DataLoader):
             num_angles=self.num_angles,
             max_rad_value=self.max_rad_value,
             rad_resolution=self.rad_resolution,
+            use_room_conditioning=self.use_room_conditioning,
         )
 
         return DataLoader(
