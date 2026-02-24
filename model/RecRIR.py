@@ -1,4 +1,4 @@
-from typing import *
+from typing import *, Literal
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -403,7 +403,8 @@ class BiSpatialNet(nn.Module):
         attention: str = "mhsa(251)",  # mhsa(frames), ret(factor)
         use_film: bool = False,
         num_room_params: int = 7,
-        use_variance_in_embedding: bool = False,
+        embedding_type: Literal["mean", "mean_std", "conv1d"] = "mean",
+        freq_conv_kernel_size: int = 31,
     ):
         super().__init__()
 
@@ -503,8 +504,22 @@ class BiSpatialNet(nn.Module):
             nn.Softmax(dim=2),
         )
 
-        self.use_variance_in_embedding = use_variance_in_embedding
-        dim_embedding = 2 * dim_hidden if use_variance_in_embedding else dim_hidden
+        self.embedding_type = embedding_type
+        if embedding_type == "conv1d":
+            dim_embedding = dim_hidden  # conv output then global pool
+            padding_freq = (freq_conv_kernel_size - 1) // 2
+            self.freq_conv = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=dim_hidden,
+                    out_channels=dim_hidden,
+                    kernel_size=freq_conv_kernel_size,
+                    padding=padding_freq,
+                ),
+                nn.PReLU(),
+            )
+        else:
+            dim_embedding = 2 * dim_hidden if embedding_type == "mean_std" else dim_hidden
+            self.freq_conv = None
 
         num_rad_classes = int(max_rad_value / rad_resolution) + 1
         self.angle_head = nn.Sequential(
@@ -565,8 +580,13 @@ class BiSpatialNet(nn.Module):
         if return_embedding:
             return x_CTF
 
-        # x_CTF: [B, F, 1, H] -> mean/std over F -> ctf_embedding: [B, 1, H] or [B, 1, 2*H]
-        if self.use_variance_in_embedding:
+        # x_CTF: [B, F, 1, H] -> aggregate over F -> ctf_embedding
+        if self.embedding_type == "conv1d":
+            # [B, F, 1, H] -> [B, H, F], conv1d -> [B, H, F], global pool -> [B, H]
+            x_freq = x_CTF.squeeze(2).permute(0, 2, 1)  # [B, H, F]
+            x_freq = self.freq_conv(x_freq)  # [B, H, F]
+            ctf_embedding = x_freq.mean(dim=-1).unsqueeze(1)  # [B, 1, H]
+        elif self.embedding_type == "mean_std":
             ctf_mean = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
             ctf_std = x_CTF.std(dim=1).squeeze(1)  # [B, 1, H]
             ctf_embedding = torch.cat([ctf_mean, ctf_std], dim=-1)  # [B, 1, 2*H]
