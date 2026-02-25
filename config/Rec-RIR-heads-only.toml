@@ -18,7 +18,7 @@ project = "rec-rir-localization"
 entity = ""  # WandB team/entity (optional, leave empty for personal account)
 name = ""  # Run name (optional, will auto-generate if empty)
 tags = ["training", "rec-rir", "heads-only"]
-notes = "Three rooms, valiant-paper-14 backbone, Training only angle_head and radius_head with frozen backbone"
+notes = "Three rooms, epoch35, Training only angle_head and radius_head with frozen backbone"
 mode = "online"  # "online", "offline", or "disabled"
 
 [acoustic]
@@ -114,7 +114,8 @@ full_share = 0
 attention = "mamba(16,4)"
 use_film = true
 num_room_params = 7
-use_variance_in_embedding = true  # Concatenate mean and std over frequency for localization heads
+embedding_type = "1dconv"  # "mean" | "variance" | "1dconv"
+embedding_1dconv_kernel = 5  # 3 or 5 when embedding_type = "1dconv"
 
 [EM_algo.args]
 sr = 16000

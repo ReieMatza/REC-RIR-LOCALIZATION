@@ -360,6 +360,29 @@ class FiLMConditioner(nn.Module):
         return gamma, beta
 
 
+class Embedding1DConv(nn.Module):
+    """1D conv over frequency → ReLU → BN → Conv1D(stride 2) → ReLU → Global Max Pool."""
+
+    def __init__(self, dim_hidden: int, kernel_size: int = 5):
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            dim_hidden, dim_hidden, kernel_size, padding=kernel_size // 2
+        )
+        self.bn1 = nn.BatchNorm1d(dim_hidden)
+        self.conv2 = nn.Conv1d(dim_hidden, dim_hidden, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x_CTF: Tensor) -> Tensor:
+        """x_CTF: [B, F, 1, H] -> out: [B, H]."""
+        x = x_CTF.squeeze(2).permute(0, 2, 1)  # [B, H, F]
+        x = self.conv1(x)
+        x = torch.relu(x)
+        x = self.bn1(x)
+        x = self.conv2(x)
+        x = torch.relu(x)
+        x = x.max(dim=2)[0]  # [B, H] global max pool
+        return x
+
+
 class FuseLayer(nn.Module):
     def __init__(
         self,
@@ -403,9 +426,11 @@ class BiSpatialNet(nn.Module):
         attention: str = "mhsa(251)",  # mhsa(frames), ret(factor)
         use_film: bool = False,
         num_room_params: int = 7,
-        use_variance_in_embedding: bool = False,
+        embedding_type: str = "mean",  # "mean" | "variance" | "1dconv"
+        embedding_1dconv_kernel: int = 5,
     ):
         super().__init__()
+        self.embedding_type = embedding_type
 
         self.padding_size = (0, (encoder_kernel_size - 1) // 2)
         self.encoder = nn.Sequential(
@@ -503,8 +528,18 @@ class BiSpatialNet(nn.Module):
             nn.Softmax(dim=2),
         )
 
-        self.use_variance_in_embedding = use_variance_in_embedding
-        dim_embedding = 2 * dim_hidden if use_variance_in_embedding else dim_hidden
+        dim_embedding = (
+            2 * dim_hidden
+            if self.embedding_type == "variance"
+            else dim_hidden
+        )
+
+        if self.embedding_type == "1dconv":
+            self.embedding_1dconv = Embedding1DConv(
+                dim_hidden, kernel_size=embedding_1dconv_kernel
+            )
+        else:
+            self.embedding_1dconv = None
 
         num_rad_classes = int(max_rad_value / rad_resolution) + 1
         self.angle_head = nn.Sequential(
@@ -565,13 +600,15 @@ class BiSpatialNet(nn.Module):
         if return_embedding:
             return x_CTF
 
-        # x_CTF: [B, F, 1, H] -> mean/std over F -> ctf_embedding: [B, 1, H] or [B, 1, 2*H]
-        if self.use_variance_in_embedding:
+        # x_CTF: [B, F, 1, H] -> ctf_embedding for localization heads
+        if self.embedding_type == "1dconv":
+            ctf_embedding = self.embedding_1dconv(x_CTF)  # [B, H]
+        elif self.embedding_type == "variance":
             ctf_mean = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
             ctf_std = x_CTF.std(dim=1).squeeze(1)  # [B, 1, H]
-            ctf_embedding = torch.cat([ctf_mean, ctf_std], dim=-1)  # [B, 1, 2*H]
+            ctf_embedding = torch.cat([ctf_mean, ctf_std], dim=-1).squeeze(1)  # [B, 2*H]
         else:
-            ctf_embedding = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
+            ctf_embedding = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H] -> squeeze to [B, H]
         if self.use_film and self.film_conditioner is not None and room_params is not None:
             gamma, beta = self.film_conditioner(room_params)
             ctf_embedding = gamma * ctf_embedding + beta
