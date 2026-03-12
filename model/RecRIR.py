@@ -363,22 +363,36 @@ class FiLMConditioner(nn.Module):
 class Embedding1DConv(nn.Module):
     """1D conv over frequency → ReLU → BN → Conv1D(stride 2) → ReLU → Global Max Pool."""
 
-    def __init__(self, dim_hidden: int, kernel_size: int = 5):
+    def __init__(
+        self,
+        dim_hidden: int,
+        kernel_size: int = 5,
+        film_post_conv1: Optional["FiLMConditioner"] = None,
+        film_post_conv2: Optional["FiLMConditioner"] = None,
+    ):
         super().__init__()
         self.conv1 = nn.Conv1d(
             dim_hidden, dim_hidden, kernel_size, padding=kernel_size // 2
         )
         self.bn1 = nn.BatchNorm1d(dim_hidden)
         self.conv2 = nn.Conv1d(dim_hidden, dim_hidden, kernel_size=3, stride=2, padding=1)
+        self.film_post_conv1 = film_post_conv1
+        self.film_post_conv2 = film_post_conv2
 
-    def forward(self, x_CTF: Tensor) -> Tensor:
+    def forward(self, x_CTF: Tensor, room_params: Optional[Tensor] = None) -> Tensor:
         """x_CTF: [B, F, 1, H] -> out: [B, H]."""
         x = x_CTF.squeeze(2).permute(0, 2, 1)  # [B, H, F]
         x = self.conv1(x)
         x = torch.relu(x)
         x = self.bn1(x)
+        if room_params is not None and self.film_post_conv1 is not None:
+            gamma, beta = self.film_post_conv1(room_params)
+            x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
         x = self.conv2(x)
         x = torch.relu(x)
+        if room_params is not None and self.film_post_conv2 is not None:
+            gamma, beta = self.film_post_conv2(room_params)
+            x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
         x = x.max(dim=2)[0]  # [B, H] global max pool
         return x
 
@@ -535,29 +549,42 @@ class BiSpatialNet(nn.Module):
         )
 
         if self.embedding_type == "1dconv":
+            if use_film:
+                self.film_embedding_conv1 = FiLMConditioner(num_room_params, dim_hidden)
+                self.film_embedding_conv2 = FiLMConditioner(num_room_params, dim_hidden)
+            else:
+                self.film_embedding_conv1 = None
+                self.film_embedding_conv2 = None
             self.embedding_1dconv = Embedding1DConv(
-                dim_hidden, kernel_size=embedding_1dconv_kernel
+                dim_hidden,
+                kernel_size=embedding_1dconv_kernel,
+                film_post_conv1=self.film_embedding_conv1,
+                film_post_conv2=self.film_embedding_conv2,
             )
         else:
             self.embedding_1dconv = None
 
         num_rad_classes = int(max_rad_value / rad_resolution) + 1
-        self.angle_head = nn.Sequential(
-            nn.Linear(in_features=dim_embedding, out_features=512),
-            nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(in_features=512, out_features=256),
-            nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(in_features=256, out_features=num_angles),
-        )
+        self.angle_fc1 = nn.Linear(in_features=dim_embedding, out_features=512)
+        self.angle_act1 = nn.ReLU()
+        self.angle_drop1 = nn.Dropout(p=0.2)
+        self.angle_fc2 = nn.Linear(in_features=512, out_features=256)
+        self.angle_act2 = nn.ReLU()
+        self.angle_drop2 = nn.Dropout(p=0.2)
+        self.angle_fc3 = nn.Linear(in_features=256, out_features=num_angles)
         self.radius_head = nn.Linear(in_features=dim_embedding, out_features=num_rad_classes)
 
         self.use_film = use_film
         if use_film:
             self.film_conditioner = FiLMConditioner(num_room_params, dim_embedding)
+            self.film_angle_1 = FiLMConditioner(num_room_params, 512)
+            self.film_angle_2 = FiLMConditioner(num_room_params, 256)
+            self.film_radius = FiLMConditioner(num_room_params, dim_embedding)
         else:
             self.film_conditioner = None
+            self.film_angle_1 = None
+            self.film_angle_2 = None
+            self.film_radius = None
 
     def forward(
         self, input: Tensor, return_embedding: bool = False, room_params: Optional[Tensor] = None
@@ -602,7 +629,7 @@ class BiSpatialNet(nn.Module):
 
         # x_CTF: [B, F, 1, H] -> ctf_embedding for localization heads
         if self.embedding_type == "1dconv":
-            ctf_embedding = self.embedding_1dconv(x_CTF)  # [B, H]
+            ctf_embedding = self.embedding_1dconv(x_CTF, room_params=room_params)  # [B, H]
         elif self.embedding_type == "variance":
             ctf_mean = x_CTF.mean(dim=1).squeeze(1)  # [B, 1, H]
             ctf_std = x_CTF.std(dim=1).squeeze(1)  # [B, 1, H]
@@ -612,8 +639,25 @@ class BiSpatialNet(nn.Module):
         if self.use_film and self.film_conditioner is not None and room_params is not None:
             gamma, beta = self.film_conditioner(room_params)
             ctf_embedding = gamma * ctf_embedding + beta
-        angle_logits = self.angle_head(ctf_embedding)
-        radius_logits = self.radius_head(ctf_embedding)
+        angle_x = self.angle_fc1(ctf_embedding)
+        angle_x = self.angle_act1(angle_x)
+        if self.use_film and self.film_angle_1 is not None and room_params is not None:
+            gamma, beta = self.film_angle_1(room_params)
+            angle_x = gamma * angle_x + beta
+        angle_x = self.angle_drop1(angle_x)
+        angle_x = self.angle_fc2(angle_x)
+        angle_x = self.angle_act2(angle_x)
+        if self.use_film and self.film_angle_2 is not None and room_params is not None:
+            gamma, beta = self.film_angle_2(room_params)
+            angle_x = gamma * angle_x + beta
+        angle_x = self.angle_drop2(angle_x)
+        angle_logits = self.angle_fc3(angle_x)
+
+        radius_in = ctf_embedding
+        if self.use_film and self.film_radius is not None and room_params is not None:
+            gamma, beta = self.film_radius(room_params)
+            radius_in = gamma * radius_in + beta
+        radius_logits = self.radius_head(radius_in)
         
         y_CTF = self.decoder_CTF(x_CTF).reshape([B, F, 2, -1]).permute(0, 2, 1, 3)
         
