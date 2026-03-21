@@ -46,7 +46,9 @@ def entry(rank, config, resume, start_ckpt):
 
     model = initialize_module(config["model"]["path"], args=config["model"]["args"])
 
-    # Freeze backbone, only train localization heads
+    # Freeze backbone, only train localization heads.
+    # FiLM modules consume room_params from the dataloader; keep model.args.num_room_params
+    # equal to dataset NUM_ROOM_PARAMS (e.g. RT60, room size, mic position, room volume).
     freeze_backbone = config["meta"].get("freeze_backbone", False)
     if freeze_backbone:
         for param in model.parameters():

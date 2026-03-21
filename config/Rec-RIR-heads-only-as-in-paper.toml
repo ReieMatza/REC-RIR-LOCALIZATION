@@ -1,10 +1,10 @@
 # Config for training only the localization heads (angle_head, radius_head)
 # with the backbone frozen from a pretrained checkpoint.
-#
+
 # Usage:
 #   torchrun --standalone --nnodes=1 --nproc_per_node=1 train.py \
-#     -c /storage/reie/REC-RIR-LOCALIZATION/config/Rec-RIR-heads-only.toml \
-#     -p /storage/reie/experiments/backbone-film-conv1d \
+#     -c /storage/reie/REC-RIR-LOCALIZATION/config/Rec-RIR-heads-only-as-in-paper.toml \
+#     -p /storage/reie/experiments/backbone-film-volume-conv1d-as-in-paper-correct \
 #     -s /storage/reie/REC-RIR-LOCALIZATION/ckpt/epoch35.tar \
 #     --freeze-backbone
 
@@ -18,7 +18,7 @@ project = "rec-rir-localization"
 entity = ""  # WandB team/entity (optional, leave empty for personal account)
 name = ""  # Run name (optional, will auto-generate if empty)
 tags = ["training", "rec-rir", ]
-notes = "Three rooms, epoch35, Training only angle_head and radius_head with frozen backbone, FILM, conv1d, 4fc7629973227016eea766fdbcfa45b6ea3e37f1"
+notes = "As in paper, backbone,FILM extended added room volume, conv1d, ea0cd1408d600450d440ce6078fdd973060a950a"
 mode = "online"  # "online", "offline", or "disabled"
 
 [acoustic]
@@ -51,9 +51,9 @@ win_type = "sqrthann"
 
 [dataloader.args]
 src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
-rir_pathlist = [ "config/rir-fixed-room-list/reie-train-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt", "config/rir-fixed-room-list/reie-validation-rir.txt",]
+rir_pathlist = [ "config/rir-ratio-center-multiple-rooms/reie-train-rir.txt", "config/rir-ratio-center-multiple-rooms/reie-validation-rir.txt", "config/rir-ratio-center-multiple-rooms/reie-validation-rir.txt",]
 noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
-localization_csv = "/storage/reie/data/rec-rir/rir-fixed-room-list/rir_localization.csv"
+localization_csv = "/storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/rir_localization.csv"
 localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
 num_angles = 181
 max_rad_value = 3.0
@@ -81,9 +81,9 @@ T_0 = 24272 # depend on the samples in one epoch
 epochs = 150
 clip_grad_norm_value = 1
 save_ckpt_interval = 1
-loss_w_cln = 0    # Backbone frozen, no need for speech loss
-loss_w_rvb = 0    # Backbone frozen, no need for reverb loss
-loss_w_rec = 0    # Backbone frozen, no need for reconstruction loss
+loss_w_cln = 1.0    # Backbone frozen, no need for speech loss
+loss_w_rvb = 1.0    # Backbone frozen, no need for reverb loss
+loss_w_rec = 1.0    # Backbone frozen, no need for reconstruction loss
 loss_w_angle = 1.0
 loss_w_radius = 1.0
 loss_type = "RIMag"

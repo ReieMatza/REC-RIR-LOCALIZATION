@@ -126,10 +126,10 @@ class MyDataset(BaseDataset):
         rad_idx = int(round(radius_m / self.rad_resolution))
         return max(0, min(num_rad - 1, rad_idx))
 
-    NUM_ROOM_PARAMS = 7  # RT60(1) + room_sz(3) + mic_center(3)
+    NUM_ROOM_PARAMS = 8  # RT60(1) + room_sz(3) + mic_center(3) + volume(1)
 
     def _extract_room_params(self, rir_dict: np.lib.npyio.NpzFile) -> Optional[torch.Tensor]:
-        """Extract and normalize room params from npz: RT60(1) + room_sz(3) + mic_center(3) = 7 scalars."""
+        """Extract and normalize room params from npz: RT60 + room_sz + mic_center + volume = 8 scalars."""
         if not self.use_room_conditioning:
             return None
         try:
@@ -150,8 +150,11 @@ class MyDataset(BaseDataset):
             room_sz_norm = np.clip(room_sz / self._room_sz_max, 0.0, 1.0)
             eps = 1e-8
             mic_center_norm = np.clip(mic_center / (room_sz + eps), 0.0, 1.0)
+            volume_m3 = float(room_sz[0] * room_sz[1] * room_sz[2])
+            vol_max = self._room_sz_max**3
+            volume_norm = np.clip(volume_m3 / vol_max, 0.0, 1.0)
             room_params = np.concatenate(
-                [[rt60_norm], room_sz_norm, mic_center_norm]
+                [[rt60_norm], room_sz_norm, mic_center_norm, [volume_norm]]
             ).astype(np.float32)
             return torch.from_numpy(room_params)
         except (KeyError, ValueError, IndexError):
