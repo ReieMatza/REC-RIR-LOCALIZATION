@@ -494,6 +494,7 @@ def generate_rir_cfg_list(
     seed: int = 2024,
     min_dist_to_wall: int = 1,
     mic_center: Optional[List[float]] = None,
+    mic_center_ratio: Optional[List[float]] = None,
     mic_center_list: Optional[List[List[float]]] = None,
     restrict_src_to_inward_halfspace: bool = False,
     max_src_tries: int = 1000,
@@ -524,6 +525,7 @@ def generate_rir_cfg_list(
         rir_dir: the dir to save generated rirs
         seed: the random seeds.
         mic_center_list: fixed mic centers aligned with room_size_list.
+        mic_center_ratio: fixed mic center as ratios of room dimensions [rx, ry, rz], each in [0,1].
     """
     def _as_vec3(x, name: str) -> Optional[np.ndarray]:
         if x is None:
@@ -542,6 +544,14 @@ def generate_rir_cfg_list(
         for i, x in enumerate(xs):
             out.append(_as_vec3(x, f"{name}[{i}]"))
         return out
+
+    def _as_ratio3(x, name: str) -> Optional[np.ndarray]:
+        arr = _as_vec3(x, name)
+        if arr is None:
+            return None
+        if np.any(arr < 0.0) or np.any(arr > 1.0):
+            raise ValueError(f"{name} must be ratios in [0,1], got {arr.tolist()}")
+        return arr
 
     def _required_mic_center_margin(array_extent_xy: float, mic_pos_var: float) -> float:
         # We allow the array to be close to a wall, but it must remain inside the room.
@@ -645,6 +655,10 @@ def generate_rir_cfg_list(
                 raise ValueError(
                     f"room_size_list length {len(room_size_list_checked)} must match mic_center_list length {len(mic_center_list_checked)}."
                 )
+        if mic_center_ratio is not None and room_size_list is not None:
+            raise ValueError("mic_center_ratio cannot be used with room_size_list/mic_center_list.")
+        if mic_center_ratio is not None and mic_center is not None:
+            raise ValueError("mic_center_ratio cannot be used with mic_center.")
 
         if os.path.exists(save_to):
             cfg = dict(np.load(save_to, allow_pickle=True))
@@ -685,6 +699,7 @@ def generate_rir_cfg_list(
     # sample radius / RT60 / room_sz / abs_weights
     array_r_this = uniform(*arr_radius)
     mic_center = _as_vec3(mic_center, "mic_center")
+    mic_center_ratio = _as_ratio3(mic_center_ratio, "mic_center_ratio")
     room_size_list = _as_vec3_list(room_size_list, "room_size_list")
     mic_center_list = _as_vec3_list(mic_center_list, "mic_center_list")
 
@@ -726,12 +741,27 @@ def generate_rir_cfg_list(
     else:
         RT60 = uniform(*RT60_lim)  # sample a RT60
         room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
+        mic_center_ratio_tmp = (
+            mic_center_ratio * np.array(room_sz, dtype=np.float64)
+            if mic_center_ratio is not None
+            else None
+        )
         # resample if the RT60 could not be satisfied in this room OR fixed mic center cannot fit this array
         while (is_valid_RT60_for_room(room_sz, RT60) == False) or (
             mic_center is not None and (not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin))
+        ) or (
+            mic_center_ratio_tmp is not None
+            and (not _is_mic_center_valid_for_room(mic_center_ratio_tmp, room_sz, req_margin))
         ):
             room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]
             RT60 = uniform(*RT60_lim)
+            mic_center_ratio_tmp = (
+                mic_center_ratio * np.array(room_sz, dtype=np.float64)
+                if mic_center_ratio is not None
+                else None
+            )
+        if mic_center_ratio_tmp is not None:
+            mic_center = mic_center_ratio_tmp
     # sample abs_weights then compute reflection coefficients
     abs_weights = [uniform(*abs_lim) for abs_lim in wall_abs_weights_lims]
     beta, t60error = beta_SabineEstimation(room_sz, RT60, abs_weights=abs_weights)
@@ -1081,8 +1111,11 @@ usage:
   python /mnt/c/Users/reiem/PythonProjects/Rec-RIR/dataset/gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_zlim '[0.5,2]' --spk_zlim '[0.5,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100,50, 50]' --fs 16000 --rir_dir /mnt/c/Users/reiem/PythonProjects/Rec-RIR/data/rirs
 
  Fixed mic center near a wall + restrict sources to inward half-space (nearest wall):
- python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --mic_center '[1.00,2.00,1.50]' --restrict_src_to_inward_halfspace true --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-mic
+ python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --mic_center '[1.00,2.00,1.50]' --restrict_src_to_inward_halfspace true --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-multiple-rooms
 
  Fixed room size list + matching mic centers (evenly distributed by index):
  python gen_rir.py --room_size_list '[[5,6,3],[6,7,3],[8,5,3]]' --mic_center_list '[[2.00,1.00,2.0],[2.00,1.00,2.0],[2.00,1.00,2.0]]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-room-list
+
+ Fixed mic center by room dimension ratios (random room sizes):
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms
 """

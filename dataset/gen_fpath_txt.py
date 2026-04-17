@@ -51,5 +51,15 @@ if __name__ == "__main__":
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-fixed-room-list/train -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-fixed-room-list/reie-train-rir.txt -e .npz
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-fixed-room-list/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-fixed-room-list/reie-validation-rir.txt -e .npz
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-fixed-room-list/test -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-fixed-room-list/reie-test-rir.txt -e .npz
+
+
+
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rirs/as_in_paper/train -o /storage/reie/REC-RIR-LOCALIZATION/config/as_in_paper/reie-train-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rirs/as_in_paper/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/as_in_paper/reie-validation-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rirs/as_in_paper/test -o /storage/reie/REC-RIR-LOCALIZATION/config/as_in_paper/reie-test-rir.txt -e .npz
+
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/train -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-train-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-validation-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/test -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-test-rir.txt -e .npz
     """
     
