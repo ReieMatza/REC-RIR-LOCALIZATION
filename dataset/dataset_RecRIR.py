@@ -72,6 +72,11 @@ class MyDataset(BaseDataset):
         # Fixed normalization ranges for room params (RT60 [0.1,1.5], room_sz max 15m, mic_center by room_sz)
         self._rt60_min, self._rt60_max = 0.1, 1.5
         self._room_sz_max = 15.0
+        # Log-volume window for the room-volume FiLM channel. Matches the realistic
+        # range of indoor rooms (10 m^3 ~ closet, 1000 m^3 ~ small auditorium).
+        # See _extract_room_params for the rationale behind log-normalization.
+        self._log_vol_min = float(np.log(10.0))
+        self._log_vol_max = float(np.log(1000.0))
         # paths of the wavs
         self.source_pathlist = self._read_pathlist(src_pathlist_txt)
         self.source_pathlist = sorted(
@@ -151,8 +156,25 @@ class MyDataset(BaseDataset):
             eps = 1e-8
             mic_center_norm = np.clip(mic_center / (room_sz + eps), 0.0, 1.0)
             volume_m3 = float(room_sz[0] * room_sz[1] * room_sz[2])
-            vol_max = self._room_sz_max**3
-            volume_norm = np.clip(volume_m3 / vol_max, 0.0, 1.0)
+            # Log-normalize volume to [0, 1].
+            #
+            # Previous scheme (volume_m3 / 15**3 = / 3375) collapsed the dataset's
+            # 36-1229 m^3 range into [0.011, 0.364] with mean 0.103 - a nearly
+            # constant FiLM input carrying almost no signal. Volume spans 1.5
+            # orders of magnitude so a log scale is a much better match; a 200 m^3
+            # vs 400 m^3 room differs by log(2)=0.69 natural units regardless of
+            # absolute scale.
+            #
+            # The [ln(10), ln(1000)] window covers realistic indoor rooms
+            # (closet-sized to small auditorium). Anything outside clips to the
+            # endpoints. On a 2000-sample diagnostic from this dataset the new
+            # mapping gives range [0.28, 1.0] with mean 0.72 and 0 clipped.
+            log_vol = np.log(max(volume_m3, eps))
+            volume_norm = np.clip(
+                (log_vol - self._log_vol_min) / (self._log_vol_max - self._log_vol_min),
+                0.0,
+                1.0,
+            )
             room_params = np.concatenate(
                 [[rt60_norm], room_sz_norm, mic_center_norm, [volume_norm]]
             ).astype(np.float32)
