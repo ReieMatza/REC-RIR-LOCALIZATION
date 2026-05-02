@@ -498,6 +498,7 @@ def generate_rir_cfg_list(
     mic_center_list: Optional[List[List[float]]] = None,
     restrict_src_to_inward_halfspace: bool = False,
     max_src_tries: int = 1000,
+    uniform_angle_radius: bool = False,
 ):
     """configuration file generation
 
@@ -526,6 +527,17 @@ def generate_rir_cfg_list(
         seed: the random seeds.
         mic_center_list: fixed mic centers aligned with room_size_list.
         mic_center_ratio: fixed mic center as ratios of room dimensions [rx, ry, rz], each in [0,1].
+        uniform_angle_radius: if True, sample source positions in polar coordinates
+            around mic_center so that the folded angle (in [0, 180] deg, matching
+            compute_angle_radius with room_sz) and the radius (in meters) are each
+            uniformly distributed over their valid ranges. Requires spk_arr_dist
+            to be an explicit (min, max) tuple. Rationale: plain Cartesian (x, y)
+            sampling gives a radial density that grows as ~r (annular area effect),
+            so small and large radii are both undersampled; combined with
+            asymmetric mic_center placement and wall-clearance rejection, it also
+            produces uneven angle marginals. Uniform (angle, radius) sampling is
+            what you want for a localization training set that doesn't need
+            class-reweighted losses to compensate for data imbalance.
     """
     def _as_vec3(x, name: str) -> Optional[np.ndarray]:
         if x is None:
@@ -669,6 +681,80 @@ def generate_rir_cfg_list(
             print("Args:")
             print(dict(args), "\n")
 
+        # Pre-flight diagnostic for uniform_angle_radius mode: surface the
+        # geometric upper bound on r_hi that the rooms can actually support
+        # at every angle. If r_hi exceeds this bound, the radius marginal
+        # will taper even with perfect (angle, radius) targeting because
+        # some (theta, r) cells are physically outside every room. Printing
+        # this at setup (rather than only leaving it for the final plot) so
+        # the user can retune before burning compute on a mismatched config.
+        if uniform_angle_radius:
+            if isinstance(spk_arr_dist, tuple) and len(spk_arr_dist) == 2:
+                r_lo_check, r_hi_check = float(spk_arr_dist[0]), float(spk_arr_dist[1])
+                # For a ratio-placed mic with the Lx<->Ly swap guarantee, the
+                # tightest radial constraint is along the x axis.  With the
+                # swap, Lx >= Ly, the mic ratio along x is mic_center_ratio[0]
+                # (typically < 0.5), and the binding wall is whichever of
+                # (x0, xL) is further (we want *both* walls reachable from
+                # the mic at radius r_hi, so the tighter side is min of the
+                # two mic-to-wall distances).
+                if mic_center_ratio is not None and room_size_lims is not None:
+                    rx = float(mic_center_ratio[0])
+                    # After swap, min_x >= min_y, so the x-axis direction is
+                    # the binding one. x_ratio_tight is the smaller of the two
+                    # x-wall distances expressed as a fraction of Lx.
+                    x_ratio_tight = min(rx, 1.0 - rx)
+                    xlim_pre = room_size_lims[0]
+                    lx_min = float(xlim_pre[0])
+                    lx_max = float(xlim_pre[1])
+                    r_max_worst = x_ratio_tight * lx_min - min_dist_to_wall
+                    r_max_best = x_ratio_tight * lx_max - min_dist_to_wall
+                    # Lx threshold above which r_hi is reachable at theta=0/180;
+                    # fraction of the Lx range that lies above that threshold
+                    # approximates the fraction of rooms in which the target
+                    # (angle, radius) cell at the extreme angles is feasible.
+                    lx_thresh = (r_hi_check + min_dist_to_wall) / x_ratio_tight
+                    frac_full_support = max(
+                        0.0,
+                        min(1.0, (lx_max - lx_thresh) / max(1e-9, (lx_max - lx_min))),
+                    )
+                    print(
+                        "[uniform_angle_radius] geometric bound on uniform radius "
+                        "(ratio-placed mic, post Lx<->Ly swap):"
+                    )
+                    print(
+                        f"  mic_center_ratio[0]={rx:.3f} -> x-wall tighter ratio={x_ratio_tight:.3f}, "
+                        f"room Lx in [{lx_min}, {lx_max}] -> r_max at theta=0/180 in "
+                        f"[{r_max_worst:.2f}, {r_max_best:.2f}] m"
+                    )
+                    print(
+                        f"  spk_arr_dist (user-requested) = [{r_lo_check}, {r_hi_check}] m"
+                    )
+                    print(
+                        f"  ~{frac_full_support*100:.0f}% of sampled rooms fully support r_hi={r_hi_check:.2f} m "
+                        f"at all angles (Lx >= {lx_thresh:.2f} m); the rest rely on phase-2 "
+                        f"relaxation (angle target kept, r free) and contribute to the "
+                        f"small-r tail."
+                    )
+                    if frac_full_support < 0.5:
+                        print(
+                            f"  NOTE: fewer than half the rooms can fit r_hi={r_hi_check} m at "
+                            f"all angles.  This still yields an EXACTLY uniform angle "
+                            f"marginal (phase-1 guarantees every angle bin is attempted), "
+                            f"but the radius marginal will droop above ~{r_max_worst:.2f} m. "
+                            f"If flatter radius matters more than coverage, either:"
+                        )
+                        print(
+                            f"    (a) raise room_size_lims x-range to min Lx >= {lx_thresh:.1f} m (loses small-room variety)"
+                        )
+                        print(
+                            f"    (b) lower spk_arr_dist[1] (e.g. to ~{(x_ratio_tight*((lx_min+lx_max)/2) - min_dist_to_wall):.2f} m, the mean-room r_max)"
+                        )
+                        print(
+                            f"    (c) use a more centered mic_center_ratio (e.g. [0.5, ry, rz])"
+                        )
+                    print()
+
         rir_num = sum(rir_nums)
         print("generating rir cfgs. ", end=" ")
         import time
@@ -762,6 +848,23 @@ def generate_rir_cfg_list(
             )
         if mic_center_ratio_tmp is not None:
             mic_center = mic_center_ratio_tmp
+        # When uniform_angle_radius is enabled with a ratio-placed mic, ensure
+        # the y-wall is the one closest to the mic. Otherwise the inward
+        # halfspace predicate restricts the accessible folded angle to a
+        # *half* of [0, 180] (x-wall nearest -> only [0, 90] accessible;
+        # xL-wall nearest -> only [90, 180] accessible), which produces the
+        # exact ~1.8:1 asymmetry seen in early runs. Swapping Lx<->Ly gives
+        # an equivalent rotated room in which the y-wall is now closer; this
+        # preserves the physical set of rooms when xlim == ylim (the common
+        # case), which you should validate yourself if your xlim != ylim.
+        if uniform_angle_radius and mic_center_ratio is not None:
+            mc = mic_center
+            Lx, Ly = room_sz[0], room_sz[1]
+            min_y = min(mc[1], Ly - mc[1])
+            min_x = min(mc[0], Lx - mc[0])
+            if min_y > min_x:
+                room_sz = [room_sz[1], room_sz[0], room_sz[2]]
+                mic_center = mic_center_ratio * np.array(room_sz, dtype=np.float64)
     # sample abs_weights then compute reflection coefficients
     abs_weights = [uniform(*abs_lim) for abs_lim in wall_abs_weights_lims]
     beta, t60error = beta_SabineEstimation(room_sz, RT60, abs_weights=abs_weights)
@@ -830,42 +933,165 @@ def generate_rir_cfg_list(
     wall_pred = None
     if restrict_src_to_inward_halfspace and mic_center is not None:
         _, wall_pred = _nearest_wall_halfspace(mic_center=mic_center, room_sz=room_sz)
-    for iiii in range(0, spk_num):
-        tries = 0
-        while True:
-            pos_src[iiii, :] = (
-                uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
-                uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
-                uniform(spk_zlim[0], spk_zlim[1]),
+
+    if uniform_angle_radius:
+        # Two-axis round-robin targeting with rejection:
+        #
+        #   - theta (folded, [0, 180] deg): round-robin across `n_th_bins`
+        #     equal-width bins. Cycle length = n_th_bins. Angle is the axis
+        #     the user most cares about for classification, so we target it
+        #     strictly: every cycle guarantees one attempt per theta bin.
+        #
+        #   - r:              round-robin across `n_r_bins` equal-width bins on
+        #     [r_lo, r_hi], with the cycle length chosen COPRIME to n_th_bins
+        #     so the joint (theta_bin, r_bin) pattern de-correlates over
+        #     consecutive samples. Radius is constrained by room geometry
+        #     (r_max depends on theta and room size) so not every bin is
+        #     reachable in every room; when the full target (theta, r) cell
+        #     is infeasible we relax only the r target, preserving the theta
+        #     target.  This keeps the angle marginal flat and lets the radius
+        #     marginal be as flat as the room lims physically allow.
+        #
+        # The angle wall-asymmetry is separately handled by the Lx<->Ly swap
+        # in the room-sampling block above; here we assume every room can
+        # reach folded angle [0, 180].
+        if mic_center is None:
+            raise ValueError("uniform_angle_radius=True requires a known mic_center.")
+        if not isinstance(spk_arr_dist, tuple) or len(spk_arr_dist) != 2:
+            raise ValueError(
+                "uniform_angle_radius=True requires spk_arr_dist=(r_min, r_max); "
+                f"got {spk_arr_dist!r}."
             )
-            if wall_pred is not None and (not wall_pred(pos_src[iiii, :])):
+        r_lo, r_hi = float(spk_arr_dist[0]), float(spk_arr_dist[1])
+        if not (r_lo >= 0.0 and r_hi > r_lo):
+            raise ValueError(
+                f"uniform_angle_radius requires 0 <= r_min < r_max; got {(r_lo, r_hi)}."
+            )
+
+        n_th_bins = 36
+        n_r_bins = 37  # coprime with 36 so (theta_bin, r_bin) cycles through all 36*37 pairs
+        th_bin = index % n_th_bins
+        r_bin = index % n_r_bins
+        th_tgt_lo = th_bin * (180.0 / n_th_bins)
+        th_tgt_hi = (th_bin + 1) * (180.0 / n_th_bins)
+        r_tgt_lo = r_lo + r_bin * (r_hi - r_lo) / n_r_bins
+        r_tgt_hi = r_lo + (r_bin + 1) * (r_hi - r_lo) / n_r_bins
+
+        def _try_place(theta_range, r_range):
+            """One rejection-sampling attempt with theta ~ U(theta_range), r ~ U(r_range).
+            Returns the sampled position if feasible this iteration, else None."""
+            theta_folded_deg = uniform(*theta_range)
+            r = uniform(*r_range)
+            z = uniform(spk_zlim[0], spk_zlim[1])
+            if not (0.0 <= z <= room_sz[2]):
+                return None
+            for side in np.random.permutation(2):
+                theta_phys_deg = (
+                    theta_folded_deg if side == 0 else 360.0 - theta_folded_deg
+                )
+                theta_phys_rad = np.deg2rad(theta_phys_deg)
+                cand = np.array(
+                    [
+                        float(mic_center[0]) + r * np.cos(theta_phys_rad),
+                        float(mic_center[1]) + r * np.sin(theta_phys_rad),
+                        z,
+                    ]
+                )
+                if cand[0] < min_dist_to_wall or cand[0] > room_sz[0] - min_dist_to_wall:
+                    continue
+                if cand[1] < min_dist_to_wall or cand[1] > room_sz[1] - min_dist_to_wall:
+                    continue
+                if wall_pred is not None and not wall_pred(cand):
+                    continue
+                return cand
+            return None
+
+        for iiii in range(0, spk_num):
+            # Only the first source participates in the round-robin targeting;
+            # extra sources for spk_num > 1 are sampled unconstrained.
+            if iiii != 0:
+                cand = None
+                for _ in range(max_src_tries):
+                    cand = _try_place((0.0, 180.0), (r_lo, r_hi))
+                    if cand is not None:
+                        break
+                if cand is None:
+                    raise RuntimeError(
+                        f"uniform_angle_radius: failed to place secondary source "
+                        f"after {max_src_tries} tries (index={index})."
+                    )
+                pos_src[iiii, :] = cand
+                continue
+
+            cand = None
+            # Phase 1: strict target theta-bin AND target r-bin.
+            for _ in range(max_src_tries // 4):
+                cand = _try_place((th_tgt_lo, th_tgt_hi), (r_tgt_lo, r_tgt_hi))
+                if cand is not None:
+                    break
+            if cand is None:
+                # Phase 2: keep theta-bin target, relax r to full range.
+                # This preserves the angle marginal exactly while letting the
+                # room dictate what radii are achievable at this angle.
+                for _ in range(max_src_tries // 2):
+                    cand = _try_place((th_tgt_lo, th_tgt_hi), (r_lo, r_hi))
+                    if cand is not None:
+                        break
+            if cand is None:
+                # Phase 3: ultimate fallback, unconstrained uniform rejection.
+                # Reached only when even the target theta-bin is geometrically
+                # infeasible in this room, which shouldn't happen with the
+                # wall-swap guarantee unless the user deliberately fixed
+                # `mic_center` instead of using ratio.
+                for _ in range(max_src_tries):
+                    cand = _try_place((0.0, 180.0), (r_lo, r_hi))
+                    if cand is not None:
+                        break
+            if cand is None:
+                raise RuntimeError(
+                    f"uniform_angle_radius: all phases failed after ~{max_src_tries} tries "
+                    f"(index={index}, room_sz={room_sz}, mic_center={mic_center.tolist()}, "
+                    f"spk_arr_dist=({r_lo}, {r_hi})). "
+                    f"Tighten spk_arr_dist, enlarge rooms, or raise max_src_tries."
+                )
+            pos_src[iiii, :] = cand
+    else:
+        for iiii in range(0, spk_num):
+            tries = 0
+            while True:
+                pos_src[iiii, :] = (
+                    uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
+                    uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
+                    uniform(spk_zlim[0], spk_zlim[1]),
+                )
+                if wall_pred is not None and (not wall_pred(pos_src[iiii, :])):
+                    tries += 1
+                    if tries >= max_src_tries:
+                        raise RuntimeError(
+                            f"Failed to sample a source position satisfying inward-halfspace after {max_src_tries} tries. "
+                            f"Try increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
+                        )
+                    continue
+                break
+            if spk_arr_dist == "random":
+                continue
+            while (
+                norm(pos_src[iiii, :] - mic_center) < spk_arr_dist[0]
+                or norm(pos_src[iiii, :] - mic_center) > spk_arr_dist[1]
+                or (wall_pred is not None and (not wall_pred(pos_src[iiii, :])))
+            ):
+                # if the spk_mic_dis requirements are not satisfied, then resample a position
+                pos_src[iiii, :] = (
+                    uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
+                    uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
+                    uniform(spk_zlim[0], spk_zlim[1]),
+                )
                 tries += 1
                 if tries >= max_src_tries:
                     raise RuntimeError(
-                        f"Failed to sample a source position satisfying inward-halfspace after {max_src_tries} tries. "
-                        f"Try increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
+                        f"Failed to sample a source position satisfying constraints after {max_src_tries} tries. "
+                        f"Try loosening spk_arr_dist, increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
                     )
-                continue
-            break
-        if spk_arr_dist == "random":
-            continue
-        while (
-            norm(pos_src[iiii, :] - mic_center) < spk_arr_dist[0]
-            or norm(pos_src[iiii, :] - mic_center) > spk_arr_dist[1]
-            or (wall_pred is not None and (not wall_pred(pos_src[iiii, :])))
-        ):
-            # if the spk_mic_dis requirements are not satisfied, then resample a position
-            pos_src[iiii, :] = (
-                uniform(min_dist_to_wall, room_sz[0] - min_dist_to_wall),
-                uniform(min_dist_to_wall, room_sz[1] - min_dist_to_wall),
-                uniform(spk_zlim[0], spk_zlim[1]),
-            )
-            tries += 1
-            if tries >= max_src_tries:
-                raise RuntimeError(
-                    f"Failed to sample a source position satisfying constraints after {max_src_tries} tries. "
-                    f"Try loosening spk_arr_dist, increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
-                )
 
     # generate the positions of noise sources
     pos_noise = []
@@ -1044,6 +1270,176 @@ def generate_rir_files(
                 handle.write(f"{rir_path},{angle_deg:.6f},{radius_m:.6f}\n")
 
 
+def plot_distribution(
+    rir_pars,
+    saveto: str,
+    num_angle_bins: int = 36,
+    num_radius_bins: int = 48,
+    rir_nums: Optional[Tuple[int, int, int]] = None,
+) -> None:
+    """Visualize the (angle, radius) distribution of a generated RIR set.
+
+    Produces a three-panel figure:
+      1. Angle histogram with a "uniform target" reference line.
+      2. Radius histogram with a "uniform target" reference line.
+      3. Joint (angle x radius) 2D heatmap.
+
+    Any departure from uniformity is immediately visible as a bar deviating
+    from the dashed red line, or as bright/dark stripes in the heatmap. This
+    is meant as a sanity check for the `uniform_angle_radius` flag.
+
+    rir_pars: list of per-sample dicts (as produced by generate_rir_cfg_list).
+    saveto: output .png path.
+    rir_nums: optional (train, val, test) split counts. If given, renders an
+      extra row of histograms per split so you can confirm the split-level
+      balance as well.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    angles: List[float] = []
+    radii: List[float] = []
+    for par in rir_pars:
+        a, r = compute_angle_radius(par["pos_src"], par["pos_rcv"], par["room_sz"])
+        angles.append(a)
+        radii.append(r)
+    angles_np = np.asarray(angles)
+    radii_np = np.asarray(radii)
+
+    r_min = 0.0
+    r_max = float(np.ceil(radii_np.max() + 0.5))
+
+    nrows = 1 if rir_nums is None else 2
+    fig, axes = plt.subplots(nrows, 3, figsize=(18, 5 * nrows), squeeze=False)
+
+    def _panel_hist(ax, values, bins, value_range, xlabel, title):
+        n, _, _ = ax.hist(
+            values,
+            bins=bins,
+            range=value_range,
+            color="steelblue",
+            edgecolor="black",
+            linewidth=0.3,
+        )
+        target = len(values) / bins if bins > 0 else 0.0
+        ax.axhline(
+            target,
+            color="red",
+            ls="--",
+            lw=1.2,
+            label=f"uniform target ({target:.0f})",
+        )
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("count")
+        ax.legend(loc="upper right")
+
+    _panel_hist(
+        axes[0, 0],
+        angles_np,
+        num_angle_bins,
+        (0.0, 180.0),
+        "angle (deg, folded to [0,180])",
+        f"Angle distribution  (N={len(angles_np)})",
+    )
+    _panel_hist(
+        axes[0, 1],
+        radii_np,
+        num_radius_bins,
+        (r_min, r_max),
+        "radius (m)",
+        f"Radius distribution  (N={len(radii_np)})",
+    )
+    h2 = axes[0, 2].hist2d(
+        angles_np,
+        radii_np,
+        bins=[num_angle_bins, num_radius_bins],
+        range=[[0.0, 180.0], [r_min, r_max]],
+        cmap="viridis",
+    )
+    plt.colorbar(h2[3], ax=axes[0, 2], label="count")
+    axes[0, 2].set_title("Joint (angle x radius)")
+    axes[0, 2].set_xlabel("angle (deg)")
+    axes[0, 2].set_ylabel("radius (m)")
+
+    if rir_nums is not None:
+        n_tr, n_va, n_te = rir_nums
+        splits = [
+            ("train", slice(0, n_tr)),
+            ("validation", slice(n_tr, n_tr + n_va)),
+            ("test", slice(n_tr + n_va, n_tr + n_va + n_te)),
+        ]
+        colors = {"train": "steelblue", "validation": "darkorange", "test": "seagreen"}
+        # Overlay per-split histograms as step traces in the same axes row.
+        for name, sl in splits:
+            a_s = angles_np[sl]
+            r_s = radii_np[sl]
+            if len(a_s) == 0:
+                continue
+            axes[1, 0].hist(
+                a_s,
+                bins=num_angle_bins,
+                range=(0.0, 180.0),
+                histtype="step",
+                linewidth=1.5,
+                color=colors[name],
+                label=f"{name} (N={len(a_s)})",
+            )
+            axes[1, 1].hist(
+                r_s,
+                bins=num_radius_bins,
+                range=(r_min, r_max),
+                histtype="step",
+                linewidth=1.5,
+                color=colors[name],
+                label=f"{name} (N={len(r_s)})",
+            )
+        axes[1, 0].set_title("Angle distribution per split")
+        axes[1, 0].set_xlabel("angle (deg)")
+        axes[1, 0].set_ylabel("count")
+        axes[1, 0].legend(loc="upper right")
+        axes[1, 1].set_title("Radius distribution per split")
+        axes[1, 1].set_xlabel("radius (m)")
+        axes[1, 1].set_ylabel("count")
+        axes[1, 1].legend(loc="upper right")
+        axes[1, 2].axis("off")
+        axes[1, 2].text(
+            0.05,
+            0.95,
+            f"total samples: {len(angles_np)}\n"
+            f"angle range observed: [{angles_np.min():.2f}, {angles_np.max():.2f}] deg\n"
+            f"radius range observed: [{radii_np.min():.3f}, {radii_np.max():.3f}] m\n"
+            f"angle CV across bins: {_cv_across_bins(angles_np, num_angle_bins, (0.0, 180.0)):.3f}\n"
+            f"radius CV across bins: {_cv_across_bins(radii_np, num_radius_bins, (r_min, r_max)):.3f}\n"
+            f"(CV = std/mean of bin counts; 0.0 = perfectly uniform)",
+            transform=axes[1, 2].transAxes,
+            va="top",
+            ha="left",
+            family="monospace",
+            fontsize=10,
+        )
+
+    fig.tight_layout()
+    save_dir = os.path.dirname(saveto)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    fig.savefig(saveto, dpi=120)
+    plt.close(fig)
+    print(f"[plot_distribution] wrote {saveto}  (N={len(angles_np)})")
+
+
+def _cv_across_bins(values: np.ndarray, num_bins: int, value_range: Tuple[float, float]) -> float:
+    """Coefficient of variation (std/mean) of per-bin counts in a histogram.
+    0.0 => perfectly uniform. Used as a scalar uniformity score.
+    """
+    counts, _ = np.histogram(values, bins=num_bins, range=value_range)
+    mean = counts.mean()
+    if mean <= 0:
+        return float("nan")
+    return float(counts.std() / mean)
+
+
 if __name__ == "__main__":
     # CUDA_VISIBLE_DEVICES=0 python generate_rirs.py --help
     parser = ArgumentParser(
@@ -1104,6 +1500,21 @@ if __name__ == "__main__":
         localization_csv_path=args.localization_csv_path,
     )
 
+    # Sanity-check plot: verifies that the (angle, radius) marginals are flat
+    # after generation. Lives at <rir_dir>/data_distribution.png so it sits
+    # next to the generated RIRs for easy review. Works whether or not
+    # uniform_angle_radius was on (lets you inspect the imbalance on legacy
+    # runs too).
+    pars_list = rir_cfg["rir_pars"]
+    # np.load turns lists into 0-d object arrays; unwrap if needed.
+    if isinstance(pars_list, np.ndarray):
+        pars_list = list(pars_list)
+    plot_distribution(
+        rir_pars=pars_list,
+        saveto=os.path.join(args.rir_dir, "data_distribution.png"),
+        rir_nums=tuple(args.rir_nums) if args.rir_nums is not None else None,
+    )
+
 """
 usage:
  python gen_rir.py --room_size_lims '[[5,5],[6,6],[2.5,2.5]]' --mic_zlim '[2,2]' --spk_zlim '[2,2]' --RT60_lim '[0.2,1.5]' --arr_room_center_dist 20 --spk_arr_dist '[0.3,3]' --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-w-localization  
@@ -1118,4 +1529,11 @@ usage:
 
  Fixed mic center by room dimension ratios (random room sizes):
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms
+
+ Uniform (angle, radius) distribution with ratio-placed mic. r_hi=3.0 is the
+ largest radius at which ~96% of the targeted (angle_bin, radius_bin) cells
+ are geometrically reachable in rooms [3,15]^2 with mic_center_ratio
+ [0.35, 0.25, 0.6]; any larger r_hi relies on phase-2 relaxation for narrow
+ angles and re-introduces a radius skew.
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-radius
 """
