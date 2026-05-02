@@ -5,8 +5,6 @@
 #   torchrun --standalone --nnodes=1 --nproc_per_node=1 train.py \
 #     -c /storage/reie/REC-RIR-LOCALIZATION/config/Rec-RIR-heads-only-as-in-paper.toml \
 #     -p /storage/reie/experiments/backbone-film-volume-conv1d-as-in-paper-correct \
-#     -s /storage/reie/REC-RIR-LOCALIZATION/ckpt/epoch35.tar \
-#     --freeze-backbone
 
 [meta]
 seed = 2024
@@ -18,7 +16,7 @@ project = "rec-rir-localization"
 entity = ""  # WandB team/entity (optional, leave empty for personal account)
 name = ""  # Run name (optional, will auto-generate if empty)
 tags = ["training", "rec-rir", ]
-notes = "As in paper, backbone,FILM extended added room volume, conv1d, ea0cd1408d600450d440ce6078fdd973060a950a"
+notes = "Changes sudgested by the model, label smoothing, radi cliping"
 mode = "online"  # "online", "offline", or "disabled"
 
 [acoustic]
@@ -56,8 +54,15 @@ noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt",
 localization_csv = "/storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/rir_localization.csv"
 localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
 num_angles = 181
-max_rad_value = 3.0
-rad_resolution = 0.1
+# Radius class range and resolution.
+# Data diagnosis: rir_localization.csv has radii up to ~12 m, with ~55% of samples
+# at radius > 3.0 m. With max_rad_value=3.0 those >3 m samples all collapse to the
+# last class (index 30), so the model literally cannot distinguish 3.5 m from 12 m.
+# We now cover the full data range and use a coarser 0.25 m grid:
+#   num_rad_classes = int(12.0 / 0.25) + 1 = 49
+# That is still finer than the physical resolvability of single-mic range.
+max_rad_value = 12.0
+rad_resolution = 0.25
 snr_range = [ 5, 20,]
 seq_lenlist = [ 4.0, 6.0, 4.0,]
 batchsize = [2, 2, 1,]
@@ -87,10 +92,25 @@ loss_w_rec = 1.0    # Backbone frozen, no need for reconstruction loss
 loss_w_angle = 1.0
 loss_w_radius = 1.0
 loss_type = "RIMag"
+# Gaussian label smoothing for the classification heads. Sigma is in CLASS units:
+# angle has 1 deg/class, radius has rad_resolution m/class (0.25 m here).
+# Set to 0.0 (or omit) to fall back to plain nn.CrossEntropyLoss.
+# Rationale: both axes are ordinal and a Dirac target penalizes "close but not exact"
+# predictions just as hard as "wildly wrong" ones, wasting capacity trying to spike
+# at bins the task cannot physically resolve. See model/lossF.GaussianLabelSmoothingLoss.
+angle_label_smoothing_sigma = 3.0    # ~ 3 deg width
+radius_label_smoothing_sigma = 2.0   # ~ 0.5 m width
 
 [trainer.validation]
 interval = 1
 save_max_metric = false
+# Metric used for selecting the "best" checkpoint. See Trainer for allowed values.
+# "localization" = angle_error_deg + best_metric_radius_weight * radius_error_m.
+# Previously this was implicitly "total" (sum of all losses weighted 1.0), which was
+# dominated by the STFT regression terms and caused the best checkpoint to track
+# denoising quality rather than localization quality.
+best_metric = "localization"
+best_metric_radius_weight = 10.0  # deg/m: 1 m radius error ~ 10 deg angle error
 
 [model.args]
 dim_input = 2
@@ -103,8 +123,9 @@ num_layers_spch = 6
 num_layers_noise = 2
 num_layers_CTF = 6
 num_angles = 181
-max_rad_value = 3.0
-rad_resolution = 0.1
+# MUST match [dataloader.args] -- the model uses these to size the radius_head output.
+max_rad_value = 12.0
+rad_resolution = 0.25
 encoder_kernel_size = 5
 dropout = [ 0, 0, 0,]
 kernel_size = [ 5, 3,]

@@ -4,6 +4,8 @@
 
 import os
 from os import path
+import json
+import numbers
 import toml
 import time
 import logging
@@ -11,6 +13,57 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from .utils import initialize_module
+
+
+def _to_jsonable_scalar(value):
+    """Coerce a wandb.log payload value to a plain JSON scalar, or return None
+    if the value isn't a scalar we can safely persist (e.g. wandb.Image).
+
+    Handles: Python numbers, bool, torch.Tensor (0-dim or 1-element), numpy
+    scalars. Anything else (including lists/dicts/images) is dropped from the
+    local JSONL mirror.
+    """
+    if isinstance(value, bool):  # bool is a numbers.Number, keep it first.
+        return value
+    if isinstance(value, numbers.Number):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.detach().item())
+        return None
+    try:
+        import numpy as _np  # local import to avoid unconditional dependency
+        if isinstance(value, _np.generic):
+            return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def _filter_shape_mismatches(ckpt_state, model_state, logger: bool = False):
+    """Drop tensors from ckpt_state whose shape disagrees with model_state.
+
+    Needed because torch's load_state_dict(strict=False) ignores missing /
+    unexpected KEYS but still raises on SHAPE mismatches for present keys.
+    This path is hit whenever a head's output dim changes between runs
+    (e.g. num_rad_classes 31 -> 49 after widening the radius range).
+    Shape-mismatched layers fall back to their freshly-initialized weights.
+    """
+    filtered = {}
+    dropped = []
+    for k, v in ckpt_state.items():
+        if k in model_state and v.shape != model_state[k].shape:
+            dropped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        filtered[k] = v
+    if logger and dropped:
+        print(
+            f"[start_ckpt] dropped {len(dropped)} tensor(s) due to shape mismatch "
+            f"(these layers keep their fresh init):"
+        )
+        for name, ckpt_shape, model_shape in dropped:
+            print(f"  - {name}: ckpt {ckpt_shape} != model {model_shape}")
+    return filtered
 
 
 class BaseTrainer:
@@ -95,6 +148,19 @@ class BaseTrainer:
         self.logger.addHandler(fh)
         self.logger.addHandler(ch)
 
+        # Local metrics mirror (JSONL). Rank 0 only. Each `_log_metrics` call
+        # appends a single line:
+        #     {"step": <step_or_null>, "<metric_name>": <scalar>, ...}
+        # Non-scalar values (wandb.Image, etc.) are dropped from the mirror.
+        # Kept as an open file handle with line-buffered flushes so a crash or
+        # SIGKILL still preserves everything logged up to the last call.
+        self._metrics_jsonl_path = path.join(self.log_dir, "metrics.jsonl")
+        if self.rank == 0:
+            # Append so that `--resume` appends to the same file across restarts.
+            self._metrics_jsonl_fh = open(self._metrics_jsonl_path, "a", buffering=1)
+        else:
+            self._metrics_jsonl_fh = None
+
         # initialization
         self.start_epoch = 1
         self.best_metric = -torch.inf if self.save_max_metric else torch.inf
@@ -111,6 +177,15 @@ class BaseTrainer:
                 for k, v in ckpt["model"].items()
                 if not any(x in k for x in ["ops", "params"])
             }
+            # strict=False only ignores missing/unexpected keys; it does NOT
+            # handle shape mismatches. If a layer's output dim changed (e.g.
+            # radius_head grew from 31 to 49 classes when we widened the radius
+            # range), PyTorch raises. Drop shape-mismatched tensors so the rest
+            # of the checkpoint still warm-starts and the mismatched layers
+            # fall back to their freshly-initialized weights.
+            ckpt["model"] = _filter_shape_mismatches(
+                ckpt["model"], self.model.state_dict(), logger=self.rank == 0
+            )
             self.model.load_state_dict(ckpt["model"], strict=False)
 
         if self.rank == 0:
@@ -186,12 +261,45 @@ class BaseTrainer:
             for k, v in ckpt["model"].items()
             if not any(x in k for x in ["ops", "params"])
         }
+        ckpt["model"] = _filter_shape_mismatches(
+            ckpt["model"], self.model.state_dict(), logger=self.rank == 0
+        )
         self.model.load_state_dict(ckpt["model"], strict=False)
 
         if self.rank == 0:
             self.logger.info(
                 f"Model checkpoint is loaded. Training will begin at epoch {self.start_epoch}."
             )
+
+    def _log_metrics(self, metrics: dict, step=None):
+        """Log a metrics dict to both WandB and the local JSONL mirror.
+
+        Drop-in replacement for `wandb.log(metrics, step=step)`. The WandB
+        call is preserved unchanged; the JSONL mirror on rank 0 records only
+        scalar entries (see _to_jsonable_scalar) so wandb.Image payloads are
+        safely ignored. Use this from any trainer method that would otherwise
+        call `wandb.log` directly.
+        """
+        if step is None:
+            wandb.log(metrics)
+        else:
+            wandb.log(metrics, step=step)
+
+        if self._metrics_jsonl_fh is None:
+            return  # Non-rank-0 ranks skip the local mirror.
+
+        record = {}
+        if step is not None:
+            record["step"] = int(step)
+        for key, value in metrics.items():
+            scalar = _to_jsonable_scalar(value)
+            if scalar is not None:
+                record[key] = scalar
+        # If nothing was scalar (e.g. an image-only payload), skip the line
+        # entirely rather than emitting a line that's just {"step": N}.
+        if len(record) <= (1 if step is not None else 0):
+            return
+        self._metrics_jsonl_fh.write(json.dumps(record) + "\n")
 
     def _set_train_mode(self):
         self.compiled_model.train()
@@ -220,7 +328,7 @@ class BaseTrainer:
             self._train_epoch(epoch)
 
             if self.rank == 0:
-                wandb.log(
+                self._log_metrics(
                     {"Lr": self.optimizer.param_groups[0]["lr"]},
                     step=self.steps,
                 )
