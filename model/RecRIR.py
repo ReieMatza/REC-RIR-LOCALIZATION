@@ -224,6 +224,7 @@ class SpatialNetLayer_nb(nn.Module):
         padding: str = "zeros",
         full: nn.Module = None,
         attention: str = "mamba(16,4)",
+        film: Optional["FiLMConditioner"] = None,
     ) -> None:
         super().__init__()
         f_conv_groups = conv_groups[0]
@@ -233,6 +234,10 @@ class SpatialNetLayer_nb(nn.Module):
         attn_params = attention[6:-1].split(",")
         d_state, mamba_conv_kernel = int(attn_params[0]), int(attn_params[1])
         self.full_share = False if full == None else True
+
+        # Optional FiLM applied at the layer output (channel-wise on H).
+        # When None the layer is exactly the original behaviour.
+        self.film = film
 
         self.norm_mamba_t_f = new_norm(
             norms[0],
@@ -276,11 +281,13 @@ class SpatialNetLayer_nb(nn.Module):
         # )
         self.dropout_mamba_t_b = nn.Dropout(dropout[1])
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, room_params: Optional[Tensor] = None) -> Tensor:
         r"""
         Args:
             x: shape [B, F, T, H]
-            att_mask: the mask for attention along T. shape [B, T, T]
+            room_params: optional [B, num_room_params] for FiLM at the layer
+                output. Ignored when ``self.film is None`` or when this is
+                None (then the layer is the identity in the FiLM dimension).
 
         Shape:
             out: shape [B, F, T, H]
@@ -293,6 +300,10 @@ class SpatialNetLayer_nb(nn.Module):
         x = x + self._mamba(
             x.flip(-2), self.mamba_t_b, self.norm_mamba_t_b, self.dropout_mamba_t_b
         ).flip(-2)
+        if self.film is not None and room_params is not None:
+            # gamma, beta: [B, H] -> broadcast to [B, 1, 1, H] over (F, T).
+            gamma, beta = self.film(room_params)
+            x = gamma[:, None, None, :] * x + beta[:, None, None, :]
         return x
 
     def _mamba(self, x: Tensor, mamba, norm: nn.Module, dropout: nn.Module):
@@ -337,21 +348,43 @@ class SpatialNetLayer_nb(nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f"full_share={self.full_share}"
+        return f"full_share={self.full_share}, film={self.film is not None}"
 
 
 class FiLMConditioner(nn.Module):
-    """Produces gamma, beta for Feature-wise Linear Modulation: out = gamma * x + beta."""
+    """Produces gamma, beta for Feature-wise Linear Modulation: out = gamma * x + beta.
 
-    def __init__(self, num_room_params: int, dim_hidden: int, hidden_mult: int = 2) -> None:
+    When ``identity_init=True``, the projection is set up so that at step 0
+    the conditioner returns ``gamma=1, beta=0`` regardless of room_params,
+    making the FiLM layer an identity. Use this when adding FiLM to a
+    warm-started module so the warm-start isn't destroyed at step 0.
+    """
+
+    def __init__(
+        self,
+        num_room_params: int,
+        dim_hidden: int,
+        hidden_mult: int = 2,
+        identity_init: bool = False,
+    ) -> None:
         super().__init__()
         hidden = num_room_params * hidden_mult
+        last = nn.Linear(hidden, dim_hidden * 2)
+        if identity_init:
+            # Zero the projection weight so the MLP output equals the bias,
+            # then split the bias into [gamma_init=1, beta_init=0]. This
+            # makes ``gamma * x + beta == x`` for every input at step 0.
+            nn.init.zeros_(last.weight)
+            with torch.no_grad():
+                last.bias.zero_()
+                last.bias[:dim_hidden].fill_(1.0)
         self.mlp = nn.Sequential(
             nn.Linear(num_room_params, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, dim_hidden * 2),
+            last,
         )
         self.dim_hidden = dim_hidden
+        self.identity_init = identity_init
 
     def forward(self, room_params: Tensor) -> Tuple[Tensor, Tensor]:
         """room_params: [B, num_params] -> gamma, beta: each [B, dim_hidden]"""
@@ -442,6 +475,16 @@ class BiSpatialNet(nn.Module):
         num_room_params: int = 8,
         embedding_type: str = "mean",  # "mean" | "variance" | "1dconv"
         embedding_1dconv_kernel: int = 5,
+        # FiLM injected into the CTF backbone (one per indicated CTF layer,
+        # applied at the layer output, channel-wise on H). Independent of
+        # ``use_film`` which controls FiLM at the embedding/heads only.
+        use_film_ctf_layers: bool = False,
+        film_ctf_layer_indices: Optional[List[int]] = None,
+        # If True, the new CTF FiLM modules are zero-initialised so that
+        # gamma=1, beta=0 at step 0 -> identity. Use this when warm-starting
+        # from a checkpoint without these modules so the warm-started CTF
+        # backbone isn't perturbed at step 0.
+        film_identity_init: bool = False,
     ):
         super().__init__()
         self.embedding_type = embedding_type
@@ -497,9 +540,37 @@ class BiSpatialNet(nn.Module):
             noise_layers.append(layer)
         self.noise_layers = nn.ModuleList(noise_layers)
         
+        # Resolve which CTF layers get a FiLM injection.
+        # Defaults to every CTF layer when use_film_ctf_layers=True and no
+        # explicit index list is given.
+        if use_film_ctf_layers:
+            if film_ctf_layer_indices is None:
+                resolved_film_ctf_idx = set(range(num_layers_CTF))
+            else:
+                resolved_film_ctf_idx = set(int(i) for i in film_ctf_layer_indices)
+                bad = [i for i in resolved_film_ctf_idx if not (0 <= i < num_layers_CTF)]
+                if bad:
+                    raise ValueError(
+                        f"film_ctf_layer_indices contains out-of-range indices "
+                        f"{bad} for num_layers_CTF={num_layers_CTF}"
+                    )
+        else:
+            resolved_film_ctf_idx = set()
+        self.use_film_ctf_layers = use_film_ctf_layers
+        self.film_ctf_layer_indices = sorted(resolved_film_ctf_idx)
+
         full = None
         ctf_layers = []
         for l in range(num_layers_CTF):
+            layer_film = (
+                FiLMConditioner(
+                    num_room_params,
+                    dim_hidden,
+                    identity_init=film_identity_init,
+                )
+                if l in resolved_film_ctf_idx
+                else None
+            )
             layer = SpatialNetLayer_nb(
                 dim_hidden=dim_hidden,
                 dim_squeeze=dim_squeeze,
@@ -511,6 +582,7 @@ class BiSpatialNet(nn.Module):
                 padding=padding,
                 full=full if l > full_share else None,
                 attention=attention,
+                film=layer_film,
             )
             if hasattr(layer, "full"):
                 full = layer.full
@@ -618,8 +690,9 @@ class BiSpatialNet(nn.Module):
         y_spch = self.decoder_spch(x).permute(0, 3, 1, 2)
         
         x=self.compress_CTF(x,x_rev)
+        ctf_room_params = room_params if self.use_film_ctf_layers else None
         for i, m in enumerate(self.ctf_layers):
-            x = m(x)
+            x = m(x, room_params=ctf_room_params)
 
         # x: [B, F, T, H] -> weight_layer(x): [B, F, T, 1] -> (x * weight).sum(-2): [B, F, H] -> unsqueeze(2): [B, F, 1, H]
         x_CTF = (x * self.weight_layer(x)).sum(-2).unsqueeze(2)  # [B, F, 1, H] = [B, F, 1, dim_hidden]
