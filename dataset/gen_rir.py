@@ -266,6 +266,33 @@ def normalize(vec: np.ndarray) -> np.ndarray:
     return vec
 
 
+def _rmax_at_angle(
+    cx: float, cy: float,
+    Lx: float, Ly: float,
+    theta_rad: float,
+    min_dist: float,
+) -> float:
+    """Maximum radius from mic center (cx, cy) in direction theta_rad before
+    hitting a wall, respecting the min_dist clearance on each wall.
+
+    Returns 0.0 when the mic is already closer than min_dist to every wall in
+    that direction (degenerate room / mic placement).
+    """
+    cos_t = np.cos(theta_rad)
+    sin_t = np.sin(theta_rad)
+    limits = []
+    if cos_t > 1e-12:
+        limits.append((Lx - min_dist - cx) / cos_t)
+    elif cos_t < -1e-12:
+        limits.append((cx - min_dist) / (-cos_t))
+    if sin_t > 1e-12:
+        limits.append((Ly - min_dist - cy) / sin_t)
+    elif sin_t < -1e-12:
+        limits.append((cy - min_dist) / (-sin_t))
+    valid = [v for v in limits if v > 0]
+    return float(min(valid)) if valid else 0.0
+
+
 def plot_room(
     room_sz: Union[List[float], np.ndarray],
     pos_src: np.ndarray,
@@ -485,7 +512,7 @@ def generate_rir_cfg_list(
     mic_num: int = 1,
     mic_pos_var: float = 0,
     spk_arr_dist: Union[
-        Tuple[float, float], Literal["auto"], Literal["random"]
+        Tuple[float, float], Tuple[float, None], Literal["auto"], Literal["random"]
     ] = "auto",
     fs: int = 16000,
     attn_diff: Tuple[Optional[float], Optional[float]] = (None, None),
@@ -689,7 +716,7 @@ def generate_rir_cfg_list(
         # this at setup (rather than only leaving it for the final plot) so
         # the user can retune before burning compute on a mismatched config.
         if uniform_angle_radius:
-            if isinstance(spk_arr_dist, tuple) and len(spk_arr_dist) == 2:
+            if isinstance(spk_arr_dist, (tuple, list)) and len(spk_arr_dist) == 2 and spk_arr_dist[1] is not None:
                 r_lo_check, r_hi_check = float(spk_arr_dist[0]), float(spk_arr_dist[1])
                 # For a ratio-placed mic with the Lx<->Ly swap guarantee, the
                 # tightest radial constraint is along the x axis.  With the
@@ -935,53 +962,68 @@ def generate_rir_cfg_list(
         _, wall_pred = _nearest_wall_halfspace(mic_center=mic_center, room_sz=room_sz)
 
     if uniform_angle_radius:
-        # Two-axis round-robin targeting with rejection:
+        # Theta round-robin targeting with two radius modes:
         #
-        #   - theta (folded, [0, 180] deg): round-robin across `n_th_bins`
-        #     equal-width bins. Cycle length = n_th_bins. Angle is the axis
-        #     the user most cares about for classification, so we target it
-        #     strictly: every cycle guarantees one attempt per theta bin.
+        # Fixed-r mode  (spk_arr_dist = [r_lo, r_hi], both floats):
+        #   - theta: round-robin across n_th_bins=36 equal bins → flat angle marginal.
+        #   - r:     round-robin across n_r_bins=37 bins on [r_lo, r_hi] (coprime with
+        #     36 so joint (theta_bin, r_bin) de-correlates).  When the full target
+        #     (theta, r) cell is infeasible the r target is relaxed (phase 2),
+        #     keeping the angle marginal flat.
         #
-        #   - r:              round-robin across `n_r_bins` equal-width bins on
-        #     [r_lo, r_hi], with the cycle length chosen COPRIME to n_th_bins
-        #     so the joint (theta_bin, r_bin) pattern de-correlates over
-        #     consecutive samples. Radius is constrained by room geometry
-        #     (r_max depends on theta and room size) so not every bin is
-        #     reachable in every room; when the full target (theta, r) cell
-        #     is infeasible we relax only the r target, preserving the theta
-        #     target.  This keeps the angle marginal flat and lets the radius
-        #     marginal be as flat as the room lims physically allow.
+        # Full-room mode  (spk_arr_dist = [r_lo, None]):
+        #   - theta: same round-robin → flat angle marginal guaranteed.
+        #   - r:     per-physical-angle r_max computed from the room boundary;
+        #     r sampled uniformly in [r_lo, r_max(theta_phys)].  No r round-robin
+        #     is needed because every sample automatically uses the full available
+        #     range at that angle.  Phase 2 (r relaxation) is also unnecessary.
         #
-        # The angle wall-asymmetry is separately handled by the Lx<->Ly swap
-        # in the room-sampling block above; here we assume every room can
-        # reach folded angle [0, 180].
+        # The angle wall-asymmetry is handled by the Lx<->Ly swap above.
         if mic_center is None:
             raise ValueError("uniform_angle_radius=True requires a known mic_center.")
-        if not isinstance(spk_arr_dist, tuple) or len(spk_arr_dist) != 2:
+        if not isinstance(spk_arr_dist, (tuple, list)) or len(spk_arr_dist) != 2:
             raise ValueError(
-                "uniform_angle_radius=True requires spk_arr_dist=(r_min, r_max); "
+                "uniform_angle_radius=True requires spk_arr_dist=(r_min, r_max) "
+                "where r_max may be None for full-room mode; "
                 f"got {spk_arr_dist!r}."
             )
-        r_lo, r_hi = float(spk_arr_dist[0]), float(spk_arr_dist[1])
-        if not (r_lo >= 0.0 and r_hi > r_lo):
-            raise ValueError(
-                f"uniform_angle_radius requires 0 <= r_min < r_max; got {(r_lo, r_hi)}."
-            )
+        r_lo = float(spk_arr_dist[0])
+        full_room_mode = spk_arr_dist[1] is None
+        r_hi = None if full_room_mode else float(spk_arr_dist[1])
+        if full_room_mode:
+            if not (r_lo >= 0.0):
+                raise ValueError(
+                    f"uniform_angle_radius full-room mode requires r_min >= 0; got {r_lo}."
+                )
+        else:
+            if not (r_lo >= 0.0 and r_hi > r_lo):
+                raise ValueError(
+                    f"uniform_angle_radius requires 0 <= r_min < r_max; got {(r_lo, r_hi)}."
+                )
 
         n_th_bins = 36
-        n_r_bins = 37  # coprime with 36 so (theta_bin, r_bin) cycles through all 36*37 pairs
         th_bin = index % n_th_bins
-        r_bin = index % n_r_bins
         th_tgt_lo = th_bin * (180.0 / n_th_bins)
         th_tgt_hi = (th_bin + 1) * (180.0 / n_th_bins)
-        r_tgt_lo = r_lo + r_bin * (r_hi - r_lo) / n_r_bins
-        r_tgt_hi = r_lo + (r_bin + 1) * (r_hi - r_lo) / n_r_bins
+
+        # Radius bin round-robin only applies in fixed-r mode.
+        if not full_room_mode:
+            n_r_bins = 37  # coprime with 36 so joint (theta_bin, r_bin) de-correlates
+            r_bin = index % n_r_bins
+            r_tgt_lo = r_lo + r_bin * (r_hi - r_lo) / n_r_bins
+            r_tgt_hi = r_lo + (r_bin + 1) * (r_hi - r_lo) / n_r_bins
 
         def _try_place(theta_range, r_range):
-            """One rejection-sampling attempt with theta ~ U(theta_range), r ~ U(r_range).
-            Returns the sampled position if feasible this iteration, else None."""
+            """One rejection-sampling attempt.
+
+            theta_range: (lo_deg, hi_deg) for the folded angle.
+            r_range:     (r_lo, r_hi) for fixed-r mode, or None for full-room
+                         mode in which r_max is computed per physical-angle
+                         direction from the room boundary.
+
+            Returns the sampled 3-D position if feasible, else None.
+            """
             theta_folded_deg = uniform(*theta_range)
-            r = uniform(*r_range)
             z = uniform(spk_zlim[0], spk_zlim[1])
             if not (0.0 <= z <= room_sz[2]):
                 return None
@@ -990,6 +1032,19 @@ def generate_rir_cfg_list(
                     theta_folded_deg if side == 0 else 360.0 - theta_folded_deg
                 )
                 theta_phys_rad = np.deg2rad(theta_phys_deg)
+
+                if r_range is None:
+                    # Full-room mode: derive r_hi from room geometry at this angle.
+                    r_hi_eff = _rmax_at_angle(
+                        float(mic_center[0]), float(mic_center[1]),
+                        room_sz[0], room_sz[1], theta_phys_rad, min_dist_to_wall,
+                    )
+                    if r_hi_eff <= r_lo:
+                        continue
+                    r = uniform(r_lo, r_hi_eff)
+                else:
+                    r = uniform(*r_range)
+
                 cand = np.array(
                     [
                         float(mic_center[0]) + r * np.cos(theta_phys_rad),
@@ -997,6 +1052,7 @@ def generate_rir_cfg_list(
                         z,
                     ]
                 )
+                # Safety wall-clearance guard (always kept even in full-room mode).
                 if cand[0] < min_dist_to_wall or cand[0] > room_sz[0] - min_dist_to_wall:
                     continue
                 if cand[1] < min_dist_to_wall or cand[1] > room_sz[1] - min_dist_to_wall:
@@ -1011,8 +1067,9 @@ def generate_rir_cfg_list(
             # extra sources for spk_num > 1 are sampled unconstrained.
             if iiii != 0:
                 cand = None
+                r_arg_free = None if full_room_mode else (r_lo, r_hi)
                 for _ in range(max_src_tries):
-                    cand = _try_place((0.0, 180.0), (r_lo, r_hi))
+                    cand = _try_place((0.0, 180.0), r_arg_free)
                     if cand is not None:
                         break
                 if cand is None:
@@ -1024,35 +1081,45 @@ def generate_rir_cfg_list(
                 continue
 
             cand = None
-            # Phase 1: strict target theta-bin AND target r-bin.
-            for _ in range(max_src_tries // 4):
-                cand = _try_place((th_tgt_lo, th_tgt_hi), (r_tgt_lo, r_tgt_hi))
-                if cand is not None:
-                    break
-            if cand is None:
-                # Phase 2: keep theta-bin target, relax r to full range.
-                # This preserves the angle marginal exactly while letting the
-                # room dictate what radii are achievable at this angle.
+            if full_room_mode:
+                # Phase 1: target theta-bin; r_max derived from room boundary.
+                # No phase 2 r-relaxation needed — r is already maximally free.
                 for _ in range(max_src_tries // 2):
-                    cand = _try_place((th_tgt_lo, th_tgt_hi), (r_lo, r_hi))
+                    cand = _try_place((th_tgt_lo, th_tgt_hi), None)
                     if cand is not None:
                         break
+            else:
+                # Phase 1: strict target theta-bin AND target r-bin.
+                for _ in range(max_src_tries // 4):
+                    cand = _try_place((th_tgt_lo, th_tgt_hi), (r_tgt_lo, r_tgt_hi))
+                    if cand is not None:
+                        break
+                if cand is None:
+                    # Phase 2: keep theta-bin target, relax r to full range.
+                    # This preserves the angle marginal exactly while letting the
+                    # room dictate what radii are achievable at this angle.
+                    for _ in range(max_src_tries // 2):
+                        cand = _try_place((th_tgt_lo, th_tgt_hi), (r_lo, r_hi))
+                        if cand is not None:
+                            break
+
             if cand is None:
                 # Phase 3: ultimate fallback, unconstrained uniform rejection.
                 # Reached only when even the target theta-bin is geometrically
                 # infeasible in this room, which shouldn't happen with the
                 # wall-swap guarantee unless the user deliberately fixed
                 # `mic_center` instead of using ratio.
+                r_arg_free = None if full_room_mode else (r_lo, r_hi)
                 for _ in range(max_src_tries):
-                    cand = _try_place((0.0, 180.0), (r_lo, r_hi))
+                    cand = _try_place((0.0, 180.0), r_arg_free)
                     if cand is not None:
                         break
             if cand is None:
                 raise RuntimeError(
                     f"uniform_angle_radius: all phases failed after ~{max_src_tries} tries "
                     f"(index={index}, room_sz={room_sz}, mic_center={mic_center.tolist()}, "
-                    f"spk_arr_dist=({r_lo}, {r_hi})). "
-                    f"Tighten spk_arr_dist, enlarge rooms, or raise max_src_tries."
+                    f"spk_arr_dist=({r_lo}, {r_hi!r})). "
+                    f"Enlarge rooms, adjust mic_center_ratio, or raise max_src_tries."
                 )
             pos_src[iiii, :] = cand
     else:
@@ -1133,7 +1200,7 @@ def generate_rir_files(
     attn_diff_noise = None
     # print(attn_diff_speech)
     # exit()
-    if isinstance(attn_diff_speech, tuple):
+    if isinstance(attn_diff_speech, (tuple, list)):
         attn_diff_noise = attn_diff_speech[1]
         attn_diff_speech = attn_diff_speech[0]
 
@@ -1536,4 +1603,12 @@ usage:
  [0.35, 0.25, 0.6]; any larger r_hi relies on phase-2 relaxation for narrow
  angles and re-introduces a radius skew.
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-radius
+
+ Uniform angle + full-room radius (no hard r_hi cap). spk_arr_dist[1]=null
+ lets each source reach anywhere in the room from the mic at the target angle.
+ The angle marginal is kept exactly flat by the theta round-robin; the radius
+ marginal spans [0.3, r_max(theta)] where r_max varies with room size and angle.
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom
+ # Or use the config file:
+ python gen_rir.py -c /storage/reie/data/rec-rir/rir-uniform-angle-fullroom/config.json
 """
