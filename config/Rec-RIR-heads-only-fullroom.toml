@@ -1,0 +1,187 @@
+# Full-model fine-tune on the full-room uniform dataset, warm-started from the
+# CTF-backbone-FiLM SOTA run.  Backbone is NOT frozen -- the whole network
+# (encoder, spch/noise/CTF backbones, all FiLM modules, heads) trains.
+#
+# Dataset: rir-uniform-angle-fullroom
+#   spk_arr_dist = [0.3, null]  (full-room radius — sources anywhere in the room)
+#   uniform_angle_radius = true (flat angle marginal over [0, 180] deg)
+#   restrict_src_to_inward_halfspace = true
+#   room_size_lims = [[3,15],[3,15],[2.5,6]]
+#   mic_wall_offset = 1.5 m, mic_z_height = 2.0 m (edge placement; legacy sets used ratio)
+#   radius observed range: [0.30, 12.31] m  (p95 = 6.23 m, p99.9 = 10.21 m)
+#
+# Warm-start: /storage/reie/experiments/uniform-data-film-ctf-backbone/ckpt/best.tar
+#   - That checkpoint was trained with max_rad_value=3.0  -> 13-class radius_head.
+#     This config uses max_rad_value=13.0 -> 53-class radius_head, so the
+#     radius_head shape mismatches.  base_trainer_RecRIR._filter_shape_mismatches
+#     will drop the mismatched tensors and load the rest, then strict=False lets
+#     the new radius_head initialise fresh.
+#   - The CTF-FiLM weights (ctf_layers.{i}.film.*) DO transfer; we set
+#     film_identity_init=false so the trained values are kept (not re-zeroed).
+#
+# Usage:
+#   cd /storage/reie/REC-RIR-LOCALIZATION
+#   torchrun --standalone --nnodes=1 --nproc_per_node=1 train.py \
+#     -c config/Rec-RIR-heads-only-fullroom.toml \
+#     -p /storage/reie/experiments/fullroom-film-ctf-backbone \
+#     -s /storage/reie/experiments/uniform-data-film-ctf-backbone/ckpt/best.tar
+
+[meta]
+seed = 2024
+cudnn_enable = true
+use_torch_compile = false
+
+[wandb]
+project = "rec-rir-localization"
+entity = ""
+name = ""
+tags = ["training", "rec-rir", "fullroom", "uniform-data", "film", "ctf-backbone", "full-finetune"]
+notes = "Full-model fine-tune (NOT heads-only) on rir-uniform-angle-fullroom, warm-started from uniform-data-film-ctf-backbone/best.tar. radius_head re-inits (3.0m->13.0m max)."
+mode = "online"
+
+[acoustic]
+path = "acoustics.feature.transforms"
+
+[dataloader]
+path = "dataset.dataset_RecRIR.MyDataloader"
+
+[optimizer]
+type = "AdamW"
+
+[scheduler]
+# CosineAnnealingLR (no restarts) -- previous runs with CosineAnnealingWarmRestarts
+# kept yanking the classification heads out of their converged basin every T_0
+# steps, regressing localization metrics after each restart. Monotonic decay
+# converged cleanly to a better localization basin.
+type = "CosineAnnealingLR"
+
+[trainer]
+path = "trainer_inferencer.trainer_RecRIR.Trainer"
+
+[model]
+path = "model.RecRIR.BiSpatialNet"
+
+[EM_algo]
+path = "method.pim.PIM"
+
+[acoustic.args]
+sr = 16000
+n_fft = 512
+win_len = 512
+hop_len = 256
+win_type = "sqrthann"
+
+[dataloader.args]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
+rir_pathlist = [ "config/rir-uniform-angle-fullroom/reie-train-rir.txt", "config/rir-uniform-angle-fullroom/reie-validation-rir.txt", "config/rir-uniform-angle-fullroom/reie-validation-rir.txt",]
+noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
+localization_csv = "/storage/reie/data/rec-rir/rir-uniform-angle-fullroom/rir_localization.csv"
+localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
+num_angles = 181
+# Full-room dataset: radii up to 12.31 m. max_rad_value=13.0 covers the full
+# range with a small margin. With rad_resolution=0.25: num_rad_classes = 53.
+max_rad_value = 13.0
+rad_resolution = 0.25
+snr_range = [ 5, 20,]
+seq_lenlist = [ 4.0, 6.0, 4.0,]
+batchsize = [2, 2, 1,]
+num_workers = 8
+seeds = [ 2022, 2023, 2024,]
+pin_memory = true
+prefetch_factor = 1
+persistent_workers = true
+rank = 0
+sr = 16000
+noisy_proportion = 1
+use_room_conditioning = true
+
+[optimizer.args]
+lr = 0.0005
+
+[scheduler.args]
+# T_max is in scheduler steps. The trainer calls `scheduler.step(self.steps)`
+# once per training step.
+#
+# IMPORTANT: the dataloader does NOT iterate every RIR every epoch -- it uses
+# a sub-sampled draw. Empirical steps/epoch on this dataloader config
+# (batchsize=2, 100k train RIRs) is 6_915 (measured directly from the
+# uniform-data-film-ctf-backbone metrics log), NOT 50_000 as a naive
+# len(train_rir)/batchsize estimate would suggest. Using the naive estimate
+# gives a T_max ~7x too large and the LR effectively never decays, which is
+# what we hit before.
+#
+#   steps_per_epoch = 6_915  (measured)
+#   total_steps     = 6_915 * 60 = 414_900
+#   T_max (padded ~1.2%) = 420_000
+T_max = 280_000
+# Don't decay all the way to zero; keep a small floor so the heads can still
+# fine-tune at the very end of training.
+eta_min = 1e-6
+
+[trainer.train]
+# 60 epochs: the CTF-backbone SOTA run converged in 40 with the backbone open
+# from a similar warm-start; we give a little extra headroom here because
+# the radius_head is being re-initialised (3.0m -> 13.0m max, 13 -> 53 classes)
+# and the data covers a much wider radius range.
+epochs = 60
+clip_grad_norm_value = 1
+save_ckpt_interval = 1
+loss_w_cln = 1.0
+loss_w_rvb = 1.0
+loss_w_rec = 1.0
+loss_w_angle = 1.0
+loss_w_radius = 1.0
+loss_type = "RIMag"
+# Gaussian label smoothing (sigma in CLASS units):
+#   angle:  1 deg/class   -> sigma=10.0 ~ 10 deg width
+#   radius: 0.25 m/class  -> sigma=2.0  ~ 0.5 m width
+# Angle sigma was bumped from 3.0 to 10.0 after the angle-head-overfit
+# diagnosis: with the fine 1-deg grid and only ~1 mic worth of spatial info,
+# a narrow target encourages confident-but-wrong predictions; a 10-deg-wide
+# Gaussian matches the information actually present in the signal.
+angle_label_smoothing_sigma = 10.0
+radius_label_smoothing_sigma = 2.0
+
+[trainer.validation]
+interval = 1
+save_max_metric = false
+best_metric = "localization"
+best_metric_radius_weight = 10.0
+
+[model.args]
+dim_input = 2
+dim_output_spch = 2
+dim_output_CTF = 120
+dim_hidden = 96
+dim_squeeze = 8
+num_freqs = 257
+num_layers_spch = 6
+num_layers_noise = 2
+num_layers_CTF = 6
+num_angles = 181
+# MUST match [dataloader.args]
+max_rad_value = 13.0
+rad_resolution = 0.25
+encoder_kernel_size = 5
+dropout = [ 0, 0, 0,]
+kernel_size = [ 5, 3,]
+conv_groups = [ 8, 8,]
+norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
+full_share = 0
+attention = "mamba(16,4)"
+use_film = true
+num_room_params = 8
+embedding_type = "1dconv"
+embedding_1dconv_kernel = 5
+# FiLM in the CTF backbone -- must match the warm-start checkpoint's
+# architecture, which has a FiLM block at the output of every CTF layer.
+use_film_ctf_layers = true
+film_ctf_layer_indices = [0, 1, 2, 3, 4, 5]
+# false here: the warm-start checkpoint already contains TRAINED CTF FiLM
+# weights, and identity_init would re-zero them, discarding what the
+# previous run learned. (identity_init=true is only useful when introducing
+# fresh FiLM blocks to a checkpoint that didn't have them.)
+film_identity_init = false
+
+[EM_algo.args]
+sr = 16000

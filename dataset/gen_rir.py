@@ -293,6 +293,199 @@ def _rmax_at_angle(
     return float(min(valid)) if valid else 0.0
 
 
+def _room_fits_edge_mic(
+    room_sz: Union[List[float], np.ndarray],
+    mic_wall_offset: float,
+    req_margin: float,
+) -> bool:
+    """True if the room can host a mic on the inner perimeter with array clearance."""
+    Lx, Ly, _ = room_sz
+    o = float(mic_wall_offset)
+    inner_w = float(Lx) - 2.0 * o
+    inner_h = float(Ly) - 2.0 * o
+    return inner_w > 2.0 * req_margin and inner_h > 2.0 * req_margin
+
+
+def _sample_mic_center_on_edge(
+    room_sz: Union[List[float], np.ndarray],
+    mic_wall_offset: float,
+    mic_z_height: float,
+    req_margin: float,
+    corner_eps: float = 1e-3,
+) -> Optional[np.ndarray]:
+    """Sample mic array center uniformly along the inner room perimeter (XY).
+
+    The center sits at distance ``mic_wall_offset`` from the nearest wall; Z is fixed.
+    Returns None when the room is too small for the offset and array margin.
+    """
+    Lx, Ly, Lz = float(room_sz[0]), float(room_sz[1]), float(room_sz[2])
+    o = float(mic_wall_offset)
+    if o < req_margin or not _room_fits_edge_mic(room_sz, o, req_margin):
+        return None
+    if not (0.0 <= mic_z_height <= Lz):
+        return None
+    inner_w = Lx - 2.0 * o
+    inner_h = Ly - 2.0 * o
+    perimeter = 2.0 * (inner_w + inner_h)
+    if perimeter <= 2.0 * corner_eps:
+        return None
+    s = float(uniform(corner_eps, perimeter - corner_eps))
+    if s < inner_w:
+        x, y = o + s, o
+    elif s < inner_w + inner_h:
+        x, y = Lx - o, o + (s - inner_w)
+    elif s < 2.0 * inner_w + inner_h:
+        x, y = Lx - o - (s - inner_w - inner_h), Ly - o
+    else:
+        x, y = o, Ly - o - (s - 2.0 * inner_w - inner_h)
+    return np.array([x, y, float(mic_z_height)], dtype=np.float64)
+
+
+def _is_mic_edge_valid_for_room(
+    mic_center: np.ndarray,
+    room_sz: List[float],
+    mic_wall_offset: float,
+    mic_z_height: float,
+    req_margin: float,
+    tol: float = 1e-4,
+) -> bool:
+    """Validate edge-placed mic center and constant height."""
+    o = float(mic_wall_offset)
+    if o < req_margin or not _room_fits_edge_mic(room_sz, o, req_margin):
+        return False
+    Lx, Ly, Lz = room_sz
+    x, y, z = mic_center.tolist()
+    if abs(z - float(mic_z_height)) > tol or not (0.0 <= z <= Lz):
+        return False
+    dist_x0, dist_xL, dist_y0, dist_yL = x, Lx - x, y, Ly - y
+    if abs(min(dist_x0, dist_xL, dist_y0, dist_yL) - o) > tol:
+        return False
+    on_x_edge = abs(x - o) < tol or abs(x - (Lx - o)) < tol
+    on_y_edge = abs(y - o) < tol or abs(y - (Ly - o)) < tol
+    if not (on_x_edge or on_y_edge):
+        return False
+    if on_x_edge and (y < req_margin - tol or y > Ly - req_margin + tol):
+        return False
+    if on_y_edge and (x < req_margin - tol or x > Lx - req_margin + tol):
+        return False
+    return True
+
+
+def _swap_room_xy_for_mic(room_sz: List[float], mic_center: np.ndarray):
+    """Swap Lx/Ly and mic x/y (used for uniform_angle_radius symmetry)."""
+    return [room_sz[1], room_sz[0], room_sz[2]], np.array(
+        [mic_center[1], mic_center[0], mic_center[2]], dtype=np.float64
+    )
+
+
+def _nearest_wall_label(x: float, y: float, Lx: float, Ly: float) -> str:
+    """Wall closest to (x, y): x0, xL, y0, or yL."""
+    dists = {"x0": x, "xL": Lx - x, "y0": y, "yL": Ly - y}
+    return min(dists, key=dists.get)
+
+
+def _mic_perimeter_features(
+    mic_xy: np.ndarray,
+    room_sz: Union[List[float], np.ndarray],
+    tol: float = 1e-3,
+) -> Optional[Tuple[str, float]]:
+    """If mic lies on the inner perimeter, return (nearest_wall, s_norm in [0, 1))."""
+    Lx, Ly = float(room_sz[0]), float(room_sz[1])
+    x, y = float(mic_xy[0]), float(mic_xy[1])
+    dist_x0, dist_xL, dist_y0, dist_yL = x, Lx - x, y, Ly - y
+    o = min(dist_x0, dist_xL, dist_y0, dist_yL)
+    on_x0 = abs(x - o) < tol
+    on_xL = abs(x - (Lx - o)) < tol
+    on_y0 = abs(y - o) < tol
+    on_yL = abs(y - (Ly - o)) < tol
+    if not (on_x0 or on_xL or on_y0 or on_yL):
+        return None
+    if not (on_x0 or on_xL) and not (on_y0 or on_yL):
+        return None
+    inner_w = Lx - 2.0 * o
+    inner_h = Ly - 2.0 * o
+    perimeter = 2.0 * (inner_w + inner_h)
+    if perimeter <= 0.0:
+        return None
+    if on_y0 and not on_xL and not on_x0:
+        s = x - o
+        wall = "y0"
+    elif on_xL and not on_yL:
+        s = inner_w + (y - o)
+        wall = "xL"
+    elif on_yL and not on_x0:
+        s = inner_w + inner_h + (Lx - o - x)
+        wall = "yL"
+    elif on_x0:
+        s = 2.0 * inner_w + inner_h + (Ly - o - y)
+        wall = "x0"
+    else:
+        wall = _nearest_wall_label(x, y, Lx, Ly)
+        if wall == "y0":
+            s = x - o
+        elif wall == "xL":
+            s = inner_w + (y - o)
+        elif wall == "yL":
+            s = inner_w + inner_h + (Lx - o - x)
+        else:
+            s = 2.0 * inner_w + inner_h + (Ly - o - y)
+    s_norm = float(np.clip(s / perimeter, 0.0, 1.0 - 1e-9))
+    return wall, s_norm
+
+
+def _mic_along_wall_coord(
+    mic_xy: np.ndarray,
+    room_sz: Union[List[float], np.ndarray],
+    wall: str,
+    tol: float = 1e-3,
+) -> Optional[float]:
+    """Normalized position in [0, 1] along the given perimeter edge (0=segment start)."""
+    Lx, Ly = float(room_sz[0]), float(room_sz[1])
+    x, y = float(mic_xy[0]), float(mic_xy[1])
+    o = min(x, Lx - x, y, Ly - y)
+    inner_w = Lx - 2.0 * o
+    inner_h = Ly - 2.0 * o
+    if inner_w <= 0.0 or inner_h <= 0.0:
+        return None
+    if wall == "y0" and abs(y - o) < tol:
+        return float(np.clip((x - o) / inner_w, 0.0, 1.0))
+    if wall == "xL" and abs(x - (Lx - o)) < tol:
+        return float(np.clip((y - o) / inner_h, 0.0, 1.0))
+    if wall == "yL" and abs(y - (Ly - o)) < tol:
+        return float(np.clip((Lx - o - x) / inner_w, 0.0, 1.0))
+    if wall == "x0" and abs(x - o) < tol:
+        return float(np.clip((Ly - o - y) / inner_h, 0.0, 1.0))
+    return None
+
+
+def _expected_mic_wall_fractions(room_sz: Union[List[float], np.ndarray], o: float) -> Dict[str, float]:
+    """Perimeter-uniform sampling: fraction of arc on each wall."""
+    Lx, Ly = float(room_sz[0]), float(room_sz[1])
+    inner_w = Lx - 2.0 * o
+    inner_h = Ly - 2.0 * o
+    perimeter = 2.0 * (inner_w + inner_h)
+    if perimeter <= 0.0:
+        return {"x0": 0.25, "xL": 0.25, "y0": 0.25, "yL": 0.25}
+    return {
+        "y0": inner_w / perimeter,
+        "xL": inner_h / perimeter,
+        "yL": inner_w / perimeter,
+        "x0": inner_h / perimeter,
+    }
+
+
+def _source_wall_features(
+    src_xy: np.ndarray,
+    room_sz: Union[List[float], np.ndarray],
+) -> Tuple[str, float]:
+    """Nearest wall label and minimum distance to any wall (m)."""
+    Lx, Ly = float(room_sz[0]), float(room_sz[1])
+    x, y = float(src_xy[0]), float(src_xy[1])
+    dists = {"x0": x, "xL": Lx - x, "y0": y, "yL": Ly - y}
+    wall = min(dists, key=dists.get)
+    return wall, float(dists[wall])
+
+
 def plot_room(
     room_sz: Union[List[float], np.ndarray],
     pos_src: np.ndarray,
@@ -521,8 +714,9 @@ def generate_rir_cfg_list(
     seed: int = 2024,
     min_dist_to_wall: int = 1,
     mic_center: Optional[List[float]] = None,
-    mic_center_ratio: Optional[List[float]] = None,
     mic_center_list: Optional[List[List[float]]] = None,
+    mic_wall_offset: Optional[float] = 1.5,
+    mic_z_height: float = 2.0,
     restrict_src_to_inward_halfspace: bool = False,
     max_src_tries: int = 1000,
     uniform_angle_radius: bool = False,
@@ -553,7 +747,12 @@ def generate_rir_cfg_list(
         rir_dir: the dir to save generated rirs
         seed: the random seeds.
         mic_center_list: fixed mic centers aligned with room_size_list.
-        mic_center_ratio: fixed mic center as ratios of room dimensions [rx, ry, rz], each in [0,1].
+        mic_wall_offset: distance (m) from mic center to nearest wall; mic is placed on the
+            room perimeter inset by this offset (uniform along the inner XY perimeter).
+            Default 1.5 m for randomized rooms. Mutually exclusive with mic_center /
+            mic_center_list. Ignored when room_size_list is used (use mic_center_list).
+        mic_z_height: constant microphone center height (m) when using mic_wall_offset.
+            mic_zlim is not used in edge mode.
         uniform_angle_radius: if True, sample source positions in polar coordinates
             around mic_center so that the folded angle (in [0, 180] deg, matching
             compute_angle_radius with room_sz) and the radius (in meters) are each
@@ -583,14 +782,6 @@ def generate_rir_cfg_list(
         for i, x in enumerate(xs):
             out.append(_as_vec3(x, f"{name}[{i}]"))
         return out
-
-    def _as_ratio3(x, name: str) -> Optional[np.ndarray]:
-        arr = _as_vec3(x, name)
-        if arr is None:
-            return None
-        if np.any(arr < 0.0) or np.any(arr > 1.0):
-            raise ValueError(f"{name} must be ratios in [0,1], got {arr.tolist()}")
-        return arr
 
     def _required_mic_center_margin(array_extent_xy: float, mic_pos_var: float) -> float:
         # We allow the array to be close to a wall, but it must remain inside the room.
@@ -694,10 +885,44 @@ def generate_rir_cfg_list(
                 raise ValueError(
                     f"room_size_list length {len(room_size_list_checked)} must match mic_center_list length {len(mic_center_list_checked)}."
                 )
-        if mic_center_ratio is not None and room_size_list is not None:
-            raise ValueError("mic_center_ratio cannot be used with room_size_list/mic_center_list.")
-        if mic_center_ratio is not None and mic_center is not None:
-            raise ValueError("mic_center_ratio cannot be used with mic_center.")
+        use_edge_mic = mic_wall_offset is not None
+        if use_edge_mic and room_size_list is not None:
+            raise ValueError(
+                "mic_wall_offset cannot be used with room_size_list; use mic_center_list instead."
+            )
+        if use_edge_mic and mic_center is not None:
+            raise ValueError("mic_wall_offset cannot be used with mic_center.")
+        if use_edge_mic and mic_center_list is not None:
+            raise ValueError("mic_wall_offset cannot be used with mic_center_list.")
+        if use_edge_mic and float(mic_wall_offset) <= 0:
+            raise ValueError(f"mic_wall_offset must be positive, got {mic_wall_offset}.")
+        if mic_center is not None and mic_center_list is not None:
+            raise ValueError("mic_center cannot be used with mic_center_list.")
+        if use_edge_mic and room_size_lims is not None and room_size_list is None:
+            o_startup = float(mic_wall_offset)
+            # Conservative probe margin (linear array r=0.1 is << 0.2 m).
+            probe_margin = 0.2
+            xlo, xhi = float(room_size_lims[0][0]), float(room_size_lims[0][1])
+            ylo, yhi = float(room_size_lims[1][0]), float(room_size_lims[1][1])
+            min_xy = min(xlo, xhi, ylo, yhi)
+            need_xy = 2.0 * o_startup + 2.0 * probe_margin + 1e-3
+            if min_xy < need_xy:
+                raise ValueError(
+                    f"room_size_lims smallest XY dimension ({min_xy:.2f} m) is too small for "
+                    f"mic_wall_offset={o_startup:.2f} m with array clearance (~{probe_margin:.2f} m). "
+                    f"Need min(Lx, Ly) >= {need_xy:.2f} m."
+                )
+            zlo, zhi = float(room_size_lims[2][0]), float(room_size_lims[2][1])
+            if float(mic_z_height) < 0.0 or float(mic_z_height) > zhi:
+                raise ValueError(
+                    f"mic_z_height={mic_z_height} must be in [0, {zhi}] (max sampled room height); "
+                    f"room_size_lims z is [{zlo}, {zhi}] for room Lz, not mic height."
+                )
+            if float(mic_z_height) > zlo:
+                print(
+                    f"  NOTE: mic_z_height={mic_z_height} m exceeds minimum room height "
+                    f"{zlo} m — rooms with Lz < {mic_z_height} will be resampled."
+                )
 
         if os.path.exists(save_to):
             cfg = dict(np.load(save_to, allow_pickle=True))
@@ -715,70 +940,48 @@ def generate_rir_cfg_list(
         # some (theta, r) cells are physically outside every room. Printing
         # this at setup (rather than only leaving it for the final plot) so
         # the user can retune before burning compute on a mismatched config.
-        if uniform_angle_radius:
+        if uniform_angle_radius and use_edge_mic and room_size_lims is not None:
             if isinstance(spk_arr_dist, (tuple, list)) and len(spk_arr_dist) == 2 and spk_arr_dist[1] is not None:
                 r_lo_check, r_hi_check = float(spk_arr_dist[0]), float(spk_arr_dist[1])
-                # For a ratio-placed mic with the Lx<->Ly swap guarantee, the
-                # tightest radial constraint is along the x axis.  With the
-                # swap, Lx >= Ly, the mic ratio along x is mic_center_ratio[0]
-                # (typically < 0.5), and the binding wall is whichever of
-                # (x0, xL) is further (we want *both* walls reachable from
-                # the mic at radius r_hi, so the tighter side is min of the
-                # two mic-to-wall distances).
-                if mic_center_ratio is not None and room_size_lims is not None:
-                    rx = float(mic_center_ratio[0])
-                    # After swap, min_x >= min_y, so the x-axis direction is
-                    # the binding one. x_ratio_tight is the smaller of the two
-                    # x-wall distances expressed as a fraction of Lx.
-                    x_ratio_tight = min(rx, 1.0 - rx)
-                    xlim_pre = room_size_lims[0]
-                    lx_min = float(xlim_pre[0])
-                    lx_max = float(xlim_pre[1])
-                    r_max_worst = x_ratio_tight * lx_min - min_dist_to_wall
-                    r_max_best = x_ratio_tight * lx_max - min_dist_to_wall
-                    # Lx threshold above which r_hi is reachable at theta=0/180;
-                    # fraction of the Lx range that lies above that threshold
-                    # approximates the fraction of rooms in which the target
-                    # (angle, radius) cell at the extreme angles is feasible.
-                    lx_thresh = (r_hi_check + min_dist_to_wall) / x_ratio_tight
-                    frac_full_support = max(
-                        0.0,
-                        min(1.0, (lx_max - lx_thresh) / max(1e-9, (lx_max - lx_min))),
+                o_check = float(mic_wall_offset)
+                xlim_pre, ylim_pre = room_size_lims[0], room_size_lims[1]
+                lx_span = (float(xlim_pre[0]), float(xlim_pre[1]))
+                ly_span = (float(ylim_pre[0]), float(ylim_pre[1]))
+                # Worst-case r_max over a few perimeter placements in smallest room.
+                r_max_samples = []
+                for lx in lx_span:
+                    for ly in ly_span:
+                        room_probe = [lx, ly, float(room_size_lims[2][0])]
+                        if not _room_fits_edge_mic(room_probe, o_check, 0.0):
+                            continue
+                        for frac in (0.25, 0.5, 0.75):
+                            inner_w = lx - 2.0 * o_check
+                            cx, cy = o_check + frac * inner_w, o_check
+                            for theta_deg in (0.0, 90.0, 180.0):
+                                r_max_samples.append(
+                                    _rmax_at_angle(
+                                        cx, cy, lx, ly,
+                                        np.deg2rad(theta_deg),
+                                        float(min_dist_to_wall),
+                                    )
+                                )
+                if r_max_samples:
+                    r_min_bound = float(min(r_max_samples))
+                    r_med_bound = float(np.median(r_max_samples))
+                    print(
+                        "[uniform_angle_radius] edge-mic geometric note "
+                        f"(mic_wall_offset={o_check:.2f} m, min_dist_to_wall={min_dist_to_wall}):"
                     )
                     print(
-                        "[uniform_angle_radius] geometric bound on uniform radius "
-                        "(ratio-placed mic, post Lx<->Ly swap):"
+                        f"  spk_arr_dist (requested) = [{r_lo_check}, {r_hi_check}] m; "
+                        f"probe r_max over room corners in [{r_min_bound:.2f}, {r_med_bound:.2f}] m "
+                        f"(min/median of sampled perimeter placements)."
                     )
-                    print(
-                        f"  mic_center_ratio[0]={rx:.3f} -> x-wall tighter ratio={x_ratio_tight:.3f}, "
-                        f"room Lx in [{lx_min}, {lx_max}] -> r_max at theta=0/180 in "
-                        f"[{r_max_worst:.2f}, {r_max_best:.2f}] m"
-                    )
-                    print(
-                        f"  spk_arr_dist (user-requested) = [{r_lo_check}, {r_hi_check}] m"
-                    )
-                    print(
-                        f"  ~{frac_full_support*100:.0f}% of sampled rooms fully support r_hi={r_hi_check:.2f} m "
-                        f"at all angles (Lx >= {lx_thresh:.2f} m); the rest rely on phase-2 "
-                        f"relaxation (angle target kept, r free) and contribute to the "
-                        f"small-r tail."
-                    )
-                    if frac_full_support < 0.5:
+                    if r_hi_check > r_min_bound:
                         print(
-                            f"  NOTE: fewer than half the rooms can fit r_hi={r_hi_check} m at "
-                            f"all angles.  This still yields an EXACTLY uniform angle "
-                            f"marginal (phase-1 guarantees every angle bin is attempted), "
-                            f"but the radius marginal will droop above ~{r_max_worst:.2f} m. "
-                            f"If flatter radius matters more than coverage, either:"
-                        )
-                        print(
-                            f"    (a) raise room_size_lims x-range to min Lx >= {lx_thresh:.1f} m (loses small-room variety)"
-                        )
-                        print(
-                            f"    (b) lower spk_arr_dist[1] (e.g. to ~{(x_ratio_tight*((lx_min+lx_max)/2) - min_dist_to_wall):.2f} m, the mean-room r_max)"
-                        )
-                        print(
-                            f"    (c) use a more centered mic_center_ratio (e.g. [0.5, ry, rz])"
+                            f"  NOTE: r_hi={r_hi_check:.2f} m exceeds the tightest probe bound "
+                            f"~{r_min_bound:.2f} m — expect phase-2 radius relaxation for some "
+                            f"(angle, r) cells; angle marginal stays flat."
                         )
                     print()
 
@@ -812,9 +1015,11 @@ def generate_rir_cfg_list(
     # sample radius / RT60 / room_sz / abs_weights
     array_r_this = uniform(*arr_radius)
     mic_center = _as_vec3(mic_center, "mic_center")
-    mic_center_ratio = _as_ratio3(mic_center_ratio, "mic_center_ratio")
     room_size_list = _as_vec3_list(room_size_list, "room_size_list")
     mic_center_list = _as_vec3_list(mic_center_list, "mic_center_list")
+    use_edge_mic = mic_wall_offset is not None
+    edge_offset = float(mic_wall_offset) if use_edge_mic else None
+    edge_z = float(mic_z_height)
 
     # Determine array extent in XY (max distance from center to any mic), which is the key constraint
     # for keeping a fixed mic array inside room boundaries.
@@ -854,44 +1059,27 @@ def generate_rir_cfg_list(
     else:
         RT60 = uniform(*RT60_lim)  # sample a RT60
         room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
-        mic_center_ratio_tmp = (
-            mic_center_ratio * np.array(room_sz, dtype=np.float64)
-            if mic_center_ratio is not None
-            else None
-        )
-        # resample if the RT60 could not be satisfied in this room OR fixed mic center cannot fit this array
-        while (is_valid_RT60_for_room(room_sz, RT60) == False) or (
-            mic_center is not None and (not _is_mic_center_valid_for_room(mic_center, room_sz, req_margin))
-        ) or (
-            mic_center_ratio_tmp is not None
-            and (not _is_mic_center_valid_for_room(mic_center_ratio_tmp, room_sz, req_margin))
-        ):
+        if use_edge_mic:
+            mic_center = _sample_mic_center_on_edge(
+                room_sz, edge_offset, edge_z, req_margin
+            )
+
+        def _mic_placement_ok() -> bool:
+            if use_edge_mic:
+                return mic_center is not None and _is_mic_edge_valid_for_room(
+                    mic_center, room_sz, edge_offset, edge_z, req_margin
+                )
+            if mic_center is not None:
+                return _is_mic_center_valid_for_room(mic_center, room_sz, req_margin)
+            return True
+
+        while (is_valid_RT60_for_room(room_sz, RT60) == False) or (not _mic_placement_ok()):
             room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]
             RT60 = uniform(*RT60_lim)
-            mic_center_ratio_tmp = (
-                mic_center_ratio * np.array(room_sz, dtype=np.float64)
-                if mic_center_ratio is not None
-                else None
-            )
-        if mic_center_ratio_tmp is not None:
-            mic_center = mic_center_ratio_tmp
-        # When uniform_angle_radius is enabled with a ratio-placed mic, ensure
-        # the y-wall is the one closest to the mic. Otherwise the inward
-        # halfspace predicate restricts the accessible folded angle to a
-        # *half* of [0, 180] (x-wall nearest -> only [0, 90] accessible;
-        # xL-wall nearest -> only [90, 180] accessible), which produces the
-        # exact ~1.8:1 asymmetry seen in early runs. Swapping Lx<->Ly gives
-        # an equivalent rotated room in which the y-wall is now closer; this
-        # preserves the physical set of rooms when xlim == ylim (the common
-        # case), which you should validate yourself if your xlim != ylim.
-        if uniform_angle_radius and mic_center_ratio is not None:
-            mc = mic_center
-            Lx, Ly = room_sz[0], room_sz[1]
-            min_y = min(mc[1], Ly - mc[1])
-            min_x = min(mc[0], Lx - mc[0])
-            if min_y > min_x:
-                room_sz = [room_sz[1], room_sz[0], room_sz[2]]
-                mic_center = mic_center_ratio * np.array(room_sz, dtype=np.float64)
+            if use_edge_mic:
+                mic_center = _sample_mic_center_on_edge(
+                    room_sz, edge_offset, edge_z, req_margin
+                )
     # sample abs_weights then compute reflection coefficients
     abs_weights = [uniform(*abs_lim) for abs_lim in wall_abs_weights_lims]
     beta, t60error = beta_SabineEstimation(room_sz, RT60, abs_weights=abs_weights)
@@ -902,7 +1090,17 @@ def generate_rir_cfg_list(
     #     warnings.warn(f'the given RT60={RT60} could not achieved with the given room_sz={room_sz} and abs_weights={abs_weights}')
 
     # microphone positions
-    if mic_center is None:
+    if use_edge_mic:
+        if mic_center is None:
+            raise RuntimeError(
+                f"Failed to place edge mic (index={index}, room_sz={room_sz}, "
+                f"mic_wall_offset={edge_offset}, req_margin={req_margin:.3f})."
+            )
+        if not (0.0 <= edge_z <= room_sz[2]):
+            raise ValueError(
+                f"mic_z_height={edge_z} is outside room z-range [0,{room_sz[2]}]."
+            )
+    elif mic_center is None:
         mic_center_tmp = None
         while (
             mic_center_tmp is None
@@ -1107,8 +1305,7 @@ def generate_rir_cfg_list(
                 # Phase 3: ultimate fallback, unconstrained uniform rejection.
                 # Reached only when even the target theta-bin is geometrically
                 # infeasible in this room, which shouldn't happen with the
-                # wall-swap guarantee unless the user deliberately fixed
-                # `mic_center` instead of using ratio.
+                # Lx/Ly swap guarantee unless the user fixed `mic_center` explicitly.
                 r_arg_free = None if full_room_mode else (r_lo, r_hi)
                 for _ in range(max_src_tries):
                     cand = _try_place((0.0, 180.0), r_arg_free)
@@ -1119,7 +1316,7 @@ def generate_rir_cfg_list(
                     f"uniform_angle_radius: all phases failed after ~{max_src_tries} tries "
                     f"(index={index}, room_sz={room_sz}, mic_center={mic_center.tolist()}, "
                     f"spk_arr_dist=({r_lo}, {r_hi!r})). "
-                    f"Enlarge rooms, adjust mic_center_ratio, or raise max_src_tries."
+                    f"Enlarge rooms, adjust mic_wall_offset/spk_arr_dist, or raise max_src_tries."
                 )
             pos_src[iiii, :] = cand
     else:
@@ -1170,7 +1367,6 @@ def generate_rir_cfg_list(
     # print(x_angle / np.pi * 180, y_angle / np.pi * 180, z_angle / np.pi * 180)
     # plot_room(room_sz=room_sz, pos_src=pos_src, pos_rcv=pos_rcv, pos_noise=pos_noise, saveto=None)
 
-    print(room_sz,pos_src,pos_rcv)
     par = {
         "index": index,
         "RT60": RT60,
@@ -1342,46 +1538,84 @@ def plot_distribution(
     saveto: str,
     num_angle_bins: int = 36,
     num_radius_bins: int = 48,
+    num_perimeter_bins: int = 36,
     rir_nums: Optional[Tuple[int, int, int]] = None,
 ) -> None:
-    """Visualize the (angle, radius) distribution of a generated RIR set.
+    """Visualize localization and geometry distributions for a generated RIR set.
 
-    Produces a three-panel figure:
-      1. Angle histogram with a "uniform target" reference line.
-      2. Radius histogram with a "uniform target" reference line.
-      3. Joint (angle x radius) 2D heatmap.
+    Rows (top to bottom):
+      1. Angle, radius, and joint (angle x radius) histograms.
+      2. (optional) Per-split angle/radius overlays + summary stats when rir_nums is set.
+      3. Mic on perimeter: edge counts (all four walls), s_norm by edge (colored), 2x2 along-wall position.
+      4. Source vs walls: nearest wall, min distance to nearest wall, radius vs min wall dist.
 
-    Any departure from uniformity is immediately visible as a bar deviating
-    from the dashed red line, or as bright/dark stripes in the heatmap. This
-    is meant as a sanity check for the `uniform_angle_radius` flag.
-
-    rir_pars: list of per-sample dicts (as produced by generate_rir_cfg_list).
+  rir_pars: list of per-sample dicts (as produced by generate_rir_cfg_list).
     saveto: output .png path.
-    rir_nums: optional (train, val, test) split counts. If given, renders an
-      extra row of histograms per split so you can confirm the split-level
-      balance as well.
+    rir_nums: optional (train, val, test) split counts for a per-split overlay row.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    wall_order = ["y0", "xL", "yL", "x0"]
+    wall_colors = {"y0": "C0", "xL": "C1", "yL": "C2", "x0": "C3"}
+
     angles: List[float] = []
     radii: List[float] = []
+    mic_walls: List[str] = []
+    mic_s_norm: List[float] = []
+    mic_along_by_wall: Dict[str, List[float]] = {w: [] for w in wall_order}
+    wall_expected_counts = {w: 0.0 for w in wall_order}
+    src_walls: List[str] = []
+    src_min_wall_dists: List[float] = []
+    n_on_edge = 0
+
     for par in rir_pars:
-        a, r = compute_angle_radius(par["pos_src"], par["pos_rcv"], par["room_sz"])
+        room_sz = par["room_sz"]
+        a, r = compute_angle_radius(par["pos_src"], par["pos_rcv"], room_sz)
         angles.append(a)
         radii.append(r)
+        rcv = np.asarray(par["pos_rcv"])
+        mic_xy = rcv.mean(axis=0)
+        src_xy = np.asarray(par["pos_src"])[0]
+        sw, sd = _source_wall_features(src_xy, room_sz)
+        src_walls.append(sw)
+        src_min_wall_dists.append(sd)
+        edge_feat = _mic_perimeter_features(mic_xy, room_sz)
+        if edge_feat is not None:
+            n_on_edge += 1
+            wall, s_norm = edge_feat
+            mic_walls.append(wall)
+            mic_s_norm.append(s_norm)
+            along = _mic_along_wall_coord(mic_xy, room_sz, wall)
+            if along is not None:
+                mic_along_by_wall[wall].append(along)
+            o = min(
+                mic_xy[0],
+                room_sz[0] - mic_xy[0],
+                mic_xy[1],
+                room_sz[1] - mic_xy[1],
+            )
+            fracs = _expected_mic_wall_fractions(room_sz, o)
+            for w in wall_order:
+                wall_expected_counts[w] += fracs[w]
+
     angles_np = np.asarray(angles)
     radii_np = np.asarray(radii)
+    src_min_wall_dists_np = np.asarray(src_min_wall_dists)
+    mic_s_norm_np = np.asarray(mic_s_norm) if mic_s_norm else np.array([])
 
     r_min = 0.0
-    r_max = float(np.ceil(radii_np.max() + 0.5))
+    r_max = float(np.ceil(radii_np.max() + 0.5)) if len(radii_np) else 1.0
+    wall_dist_max = float(np.ceil(src_min_wall_dists_np.max() + 0.5)) if len(src_min_wall_dists_np) else 1.0
 
-    nrows = 1 if rir_nums is None else 2
-    fig, axes = plt.subplots(nrows, 3, figsize=(18, 5 * nrows), squeeze=False)
+    nrows_total = (2 if rir_nums is not None else 1) + 2
+    mic_row = nrows_total - 2
+    src_row = nrows_total - 1
+    fig, axes = plt.subplots(nrows_total, 3, figsize=(18, 5 * nrows_total), squeeze=False)
 
-    def _panel_hist(ax, values, bins, value_range, xlabel, title):
-        n, _, _ = ax.hist(
+    def _panel_hist(ax, values, bins, value_range, xlabel, title, show_uniform_target: bool = True):
+        ax.hist(
             values,
             bins=bins,
             range=value_range,
@@ -1389,18 +1623,19 @@ def plot_distribution(
             edgecolor="black",
             linewidth=0.3,
         )
-        target = len(values) / bins if bins > 0 else 0.0
-        ax.axhline(
-            target,
-            color="red",
-            ls="--",
-            lw=1.2,
-            label=f"uniform target ({target:.0f})",
-        )
+        if show_uniform_target and bins > 0 and len(values) > 0:
+            target = len(values) / bins
+            ax.axhline(
+                target,
+                color="red",
+                ls="--",
+                lw=1.2,
+                label=f"uniform target ({target:.0f})",
+            )
+            ax.legend(loc="upper right")
         ax.set_title(title)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("count")
-        ax.legend(loc="upper right")
 
     _panel_hist(
         axes[0, 0],
@@ -1438,7 +1673,6 @@ def plot_distribution(
             ("test", slice(n_tr + n_va, n_tr + n_va + n_te)),
         ]
         colors = {"train": "steelblue", "validation": "darkorange", "test": "seagreen"}
-        # Overlay per-split histograms as step traces in the same axes row.
         for name, sl in splits:
             a_s = angles_np[sl]
             r_s = radii_np[sl]
@@ -1470,16 +1704,33 @@ def plot_distribution(
         axes[1, 1].set_xlabel("radius (m)")
         axes[1, 1].set_ylabel("count")
         axes[1, 1].legend(loc="upper right")
+        mic_wall_cv = (
+            _cv_across_bins(
+                np.array([wall_order.index(w) for w in mic_walls], dtype=np.float64),
+                len(wall_order),
+                (0.0, float(len(wall_order))),
+            )
+            if mic_walls
+            else float("nan")
+        )
+        mic_perim_cv = (
+            _cv_across_bins(mic_s_norm_np, num_perimeter_bins, (0.0, 1.0))
+            if len(mic_s_norm_np)
+            else float("nan")
+        )
         axes[1, 2].axis("off")
         axes[1, 2].text(
             0.05,
             0.95,
             f"total samples: {len(angles_np)}\n"
-            f"angle range observed: [{angles_np.min():.2f}, {angles_np.max():.2f}] deg\n"
-            f"radius range observed: [{radii_np.min():.3f}, {radii_np.max():.3f}] m\n"
-            f"angle CV across bins: {_cv_across_bins(angles_np, num_angle_bins, (0.0, 180.0)):.3f}\n"
-            f"radius CV across bins: {_cv_across_bins(radii_np, num_radius_bins, (r_min, r_max)):.3f}\n"
-            f"(CV = std/mean of bin counts; 0.0 = perfectly uniform)",
+            f"mics on perimeter: {n_on_edge}/{len(angles_np)}\n"
+            f"angle range: [{angles_np.min():.2f}, {angles_np.max():.2f}] deg\n"
+            f"radius range: [{radii_np.min():.3f}, {radii_np.max():.3f}] m\n"
+            f"angle CV: {_cv_across_bins(angles_np, num_angle_bins, (0.0, 180.0)):.3f}\n"
+            f"radius CV: {_cv_across_bins(radii_np, num_radius_bins, (r_min, r_max)):.3f}\n"
+            f"mic wall CV: {mic_wall_cv:.3f}\n"
+            f"mic perimeter CV: {mic_perim_cv:.3f}\n"
+            f"(CV = std/mean bin counts; 0 = uniform)",
             transform=axes[1, 2].transAxes,
             va="top",
             ha="left",
@@ -1487,13 +1738,163 @@ def plot_distribution(
             fontsize=10,
         )
 
+    # --- Mic edge row ---
+    ax_mw = axes[mic_row, 0]
+    if mic_walls:
+        wall_counts = {w: mic_walls.count(w) for w in wall_order}
+        counts_arr = [wall_counts[w] for w in wall_order]
+        x_pos = np.arange(len(wall_order))
+        bars = ax_mw.bar(
+            x_pos,
+            counts_arr,
+            color=[wall_colors[w] for w in wall_order],
+            edgecolor="black",
+        )
+        for i, (w, bar) in enumerate(zip(wall_order, bars)):
+            exp = wall_expected_counts[w]
+            ax_mw.hlines(exp, i - 0.4, i + 0.4, colors="red", linestyles="--", linewidth=1.5)
+            pct = 100.0 * bar.get_height() / max(len(mic_walls), 1)
+            exp_pct = 100.0 * exp / max(len(mic_walls), 1)
+            ax_mw.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{pct:.0f}%\n(exp {exp_pct:.0f}%)",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax_mw.set_xticks(x_pos)
+        ax_mw.set_xticklabels(wall_order)
+        ax_mw.set_title(
+            f"Mic perimeter edge  (on-edge N={len(mic_walls)}/{len(angles_np)})"
+        )
+        ax_mw.set_xlabel("which wall segment (y0=bottom, xL=right, yL=top, x0=left)")
+        ax_mw.set_ylabel("count")
+        ax_mw.plot([], [], color="red", ls="--", label="expected (length-weighted)")
+        ax_mw.legend(loc="upper right")
+    else:
+        ax_mw.axis("off")
+        ax_mw.text(
+            0.5,
+            0.5,
+            "No mics detected on room perimeter\n(fixed/random mic_center?)",
+            ha="center",
+            va="center",
+            transform=ax_mw.transAxes,
+        )
+
+    ax_mp = axes[mic_row, 1]
+    if len(mic_s_norm_np):
+        bins = np.linspace(0.0, 1.0, num_perimeter_bins + 1)
+        for w in wall_order:
+            vals = [s for s, wl in zip(mic_s_norm, mic_walls) if wl == w]
+            if vals:
+                ax_mp.hist(
+                    vals,
+                    bins=bins,
+                    histtype="stepfilled",
+                    alpha=0.45,
+                    color=wall_colors[w],
+                    label=f"{w} (n={len(vals)})",
+                )
+        target = len(mic_s_norm_np) / num_perimeter_bins
+        ax_mp.axhline(
+            target,
+            color="red",
+            ls="--",
+            lw=1.2,
+            label=f"uniform if pooled ({target:.0f}/bin)",
+        )
+        ax_mp.set_xlim(0.0, 1.0)
+        ax_mp.set_title("Mic s_norm by perimeter edge (color = wall segment)")
+        ax_mp.set_xlabel("normalized arc s along full perimeter [0, 1)")
+        ax_mp.set_ylabel("count")
+        ax_mp.legend(loc="upper right", fontsize=8)
+    else:
+        ax_mp.axis("off")
+        ax_mp.text(0.5, 0.5, "No on-edge mics", ha="center", va="center", transform=ax_mp.transAxes)
+
+    axes[mic_row, 2].axis("off")
+    if mic_walls:
+        gs_quad = axes[mic_row, 2].get_subplotspec().subgridspec(2, 2, wspace=0.35, hspace=0.45)
+        along_bins = max(8, num_perimeter_bins // 4)
+        for idx, w in enumerate(wall_order):
+            ax_aw = fig.add_subplot(gs_quad[idx // 2, idx % 2])
+            vals = np.asarray(mic_along_by_wall[w], dtype=np.float64)
+            if len(vals) > 0:
+                ax_aw.hist(
+                    vals,
+                    bins=along_bins,
+                    range=(0.0, 1.0),
+                    color=wall_colors[w],
+                    edgecolor="black",
+                    linewidth=0.3,
+                )
+                tgt = len(vals) / along_bins
+                ax_aw.axhline(tgt, color="red", ls="--", lw=1.0)
+            ax_aw.set_xlim(0.0, 1.0)
+            ax_aw.set_title(f"{w}  n={len(vals)}", fontsize=10)
+            ax_aw.set_xlabel("position along edge [0,1]")
+            if idx % 2 == 0:
+                ax_aw.set_ylabel("count")
+        axes[mic_row, 2].text(
+            0.5,
+            1.02,
+            "Along-wall position on each edge (dashed = uniform target)",
+            transform=axes[mic_row, 2].transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    else:
+        axes[mic_row, 2].text(
+            0.5, 0.5, "No on-edge mics", ha="center", va="center", transform=axes[mic_row, 2].transAxes
+        )
+
+    # --- Source wall row ---
+    src_wall_counts = [src_walls.count(w) for w in wall_order]
+    ax_sw = axes[src_row, 0]
+    ax_sw.bar(
+        np.arange(len(wall_order)),
+        src_wall_counts,
+        color=[wall_colors[w] for w in wall_order],
+        edgecolor="black",
+    )
+    ax_sw.set_xticks(np.arange(len(wall_order)))
+    ax_sw.set_xticklabels(wall_order)
+    ax_sw.set_title(f"Source nearest wall  (N={len(src_walls)})")
+    ax_sw.set_xlabel("wall")
+    ax_sw.set_ylabel("count")
+
+    _panel_hist(
+        axes[src_row, 1],
+        src_min_wall_dists_np,
+        min(40, max(10, len(src_min_wall_dists_np) // 5)),
+        (0.0, wall_dist_max),
+        "min distance to any wall (m)",
+        f"Source wall clearance  (N={len(src_min_wall_dists_np)})",
+        show_uniform_target=False,
+    )
+
+    h3 = axes[src_row, 2].hist2d(
+        radii_np,
+        src_min_wall_dists_np,
+        bins=[num_radius_bins, min(40, max(10, len(radii_np) // 5))],
+        range=[[r_min, r_max], [0.0, wall_dist_max]],
+        cmap="viridis",
+    )
+    plt.colorbar(h3[3], ax=axes[src_row, 2], label="count")
+    axes[src_row, 2].set_title("Joint (radius x min wall dist)")
+    axes[src_row, 2].set_xlabel("radius (m)")
+    axes[src_row, 2].set_ylabel("min wall dist (m)")
+
     fig.tight_layout()
     save_dir = os.path.dirname(saveto)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
     fig.savefig(saveto, dpi=120)
     plt.close(fig)
-    print(f"[plot_distribution] wrote {saveto}  (N={len(angles_np)})")
+    print(f"[plot_distribution] wrote {saveto}  (N={len(angles_np)}, on-edge mics={n_on_edge})")
 
 
 def _cv_across_bins(values: np.ndarray, num_bins: int, value_range: Tuple[float, float]) -> float:
@@ -1594,21 +1995,14 @@ usage:
  Fixed room size list + matching mic centers (evenly distributed by index):
  python gen_rir.py --room_size_list '[[5,6,3],[6,7,3],[8,5,3]]' --mic_center_list '[[2.00,1.00,2.0],[2.00,1.00,2.0],[2.00,1.00,2.0]]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-room-list
 
- Fixed mic center by room dimension ratios (random room sizes):
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms
-
- Uniform (angle, radius) distribution with ratio-placed mic. r_hi=3.0 is the
- largest radius at which ~96% of the targeted (angle_bin, radius_bin) cells
- are geometrically reachable in rooms [3,15]^2 with mic_center_ratio
- [0.35, 0.25, 0.6]; any larger r_hi relies on phase-2 relaxation for narrow
- angles and re-introduces a radius skew.
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-radius
+ Edge mic on room perimeter (uniform along walls) + uniform (angle, radius):
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 1.5 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-edge-mic
 
  Uniform angle + full-room radius (no hard r_hi cap). spk_arr_dist[1]=null
  lets each source reach anywhere in the room from the mic at the target angle.
  The angle marginal is kept exactly flat by the theta round-robin; the radius
  marginal spans [0.3, r_max(theta)] where r_max varies with room size and angle.
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_center_ratio '[0.35,0.25,0.6]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 1.5 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom
  # Or use the config file:
  python gen_rir.py -c /storage/reie/data/rec-rir/rir-uniform-angle-fullroom/config.json
 """
