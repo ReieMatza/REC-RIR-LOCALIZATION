@@ -298,7 +298,7 @@ def _room_fits_edge_mic(
     mic_wall_offset: float,
     req_margin: float,
 ) -> bool:
-    """True if the room can host a mic on the inner perimeter with array clearance."""
+    """True if the room can host a mic on the y0 x-parallel edge with array clearance."""
     Lx, Ly, _ = room_sz
     o = float(mic_wall_offset)
     inner_w = float(Lx) - 2.0 * o
@@ -313,9 +313,11 @@ def _sample_mic_center_on_edge(
     req_margin: float,
     corner_eps: float = 1e-3,
 ) -> Optional[np.ndarray]:
-    """Sample mic array center uniformly along the inner room perimeter (XY).
+    """Sample mic array center on the low-y x-parallel edge (y0 wall) only.
 
-    The center sits at distance ``mic_wall_offset`` from the nearest wall; Z is fixed.
+    The center has ``y = mic_wall_offset`` and ``x`` uniform along the inset edge
+    from ``x = o`` to ``x = Lx - o``.  This matches folded angle labels in
+    [0, 180] deg (no need to sample mics on all four perimeter walls).  Z is fixed.
     Returns None when the room is too small for the offset and array margin.
     """
     Lx, Ly, Lz = float(room_sz[0]), float(room_sz[1]), float(room_sz[2])
@@ -325,19 +327,10 @@ def _sample_mic_center_on_edge(
     if not (0.0 <= mic_z_height <= Lz):
         return None
     inner_w = Lx - 2.0 * o
-    inner_h = Ly - 2.0 * o
-    perimeter = 2.0 * (inner_w + inner_h)
-    if perimeter <= 2.0 * corner_eps:
+    if inner_w <= 2.0 * corner_eps:
         return None
-    s = float(uniform(corner_eps, perimeter - corner_eps))
-    if s < inner_w:
-        x, y = o + s, o
-    elif s < inner_w + inner_h:
-        x, y = Lx - o, o + (s - inner_w)
-    elif s < 2.0 * inner_w + inner_h:
-        x, y = Lx - o - (s - inner_w - inner_h), Ly - o
-    else:
-        x, y = o, Ly - o - (s - 2.0 * inner_w - inner_h)
+    x = float(uniform(o + corner_eps, Lx - o - corner_eps))
+    y = o
     return np.array([x, y, float(mic_z_height)], dtype=np.float64)
 
 
@@ -349,7 +342,7 @@ def _is_mic_edge_valid_for_room(
     req_margin: float,
     tol: float = 1e-4,
 ) -> bool:
-    """Validate edge-placed mic center and constant height."""
+    """Validate mic on the y0 x-parallel edge (y = mic_wall_offset) and constant height."""
     o = float(mic_wall_offset)
     if o < req_margin or not _room_fits_edge_mic(room_sz, o, req_margin):
         return False
@@ -357,16 +350,9 @@ def _is_mic_edge_valid_for_room(
     x, y, z = mic_center.tolist()
     if abs(z - float(mic_z_height)) > tol or not (0.0 <= z <= Lz):
         return False
-    dist_x0, dist_xL, dist_y0, dist_yL = x, Lx - x, y, Ly - y
-    if abs(min(dist_x0, dist_xL, dist_y0, dist_yL) - o) > tol:
+    if abs(y - o) > tol:
         return False
-    on_x_edge = abs(x - o) < tol or abs(x - (Lx - o)) < tol
-    on_y_edge = abs(y - o) < tol or abs(y - (Ly - o)) < tol
-    if not (on_x_edge or on_y_edge):
-        return False
-    if on_x_edge and (y < req_margin - tol or y > Ly - req_margin + tol):
-        return False
-    if on_y_edge and (x < req_margin - tol or x > Lx - req_margin + tol):
+    if x < req_margin - tol or x > Lx - req_margin + tol:
         return False
     return True
 
@@ -459,19 +445,8 @@ def _mic_along_wall_coord(
 
 
 def _expected_mic_wall_fractions(room_sz: Union[List[float], np.ndarray], o: float) -> Dict[str, float]:
-    """Perimeter-uniform sampling: fraction of arc on each wall."""
-    Lx, Ly = float(room_sz[0]), float(room_sz[1])
-    inner_w = Lx - 2.0 * o
-    inner_h = Ly - 2.0 * o
-    perimeter = 2.0 * (inner_w + inner_h)
-    if perimeter <= 0.0:
-        return {"x0": 0.25, "xL": 0.25, "y0": 0.25, "yL": 0.25}
-    return {
-        "y0": inner_w / perimeter,
-        "xL": inner_h / perimeter,
-        "yL": inner_w / perimeter,
-        "x0": inner_h / perimeter,
-    }
+    """Edge-mic sampling places all mics on the y0 (low-y x-parallel) wall."""
+    return {"y0": 1.0, "xL": 0.0, "yL": 0.0, "x0": 0.0}
 
 
 def _source_wall_features(
@@ -747,8 +722,9 @@ def generate_rir_cfg_list(
         rir_dir: the dir to save generated rirs
         seed: the random seeds.
         mic_center_list: fixed mic centers aligned with room_size_list.
-        mic_wall_offset: distance (m) from mic center to nearest wall; mic is placed on the
-            room perimeter inset by this offset (uniform along the inner XY perimeter).
+        mic_wall_offset: distance (m) from mic center to the low-y wall; mic is placed on
+            the x-parallel y0 edge only (y = mic_wall_offset, x uniform along that edge).
+            Matches folded angle labels in [0, 180] deg without sampling all four walls.
             Default 1.5 m for randomized rooms. Mutually exclusive with mic_center /
             mic_center_list. Ignored when room_size_list is used (use mic_center_list).
         mic_z_height: constant microphone center height (m) when using mic_wall_offset.
@@ -1176,7 +1152,8 @@ def generate_rir_cfg_list(
         #     is needed because every sample automatically uses the full available
         #     range at that angle.  Phase 2 (r relaxation) is also unnecessary.
         #
-        # The angle wall-asymmetry is handled by the Lx<->Ly swap above.
+        # Mic is on the y0 edge only (see _sample_mic_center_on_edge), consistent with
+        # folded [0, 180] deg labels — sources use restrict_src_to_inward_halfspace (+y).
         if mic_center is None:
             raise ValueError("uniform_angle_radius=True requires a known mic_center.")
         if not isinstance(spk_arr_dist, (tuple, list)) or len(spk_arr_dist) != 2:
@@ -1305,7 +1282,7 @@ def generate_rir_cfg_list(
                 # Phase 3: ultimate fallback, unconstrained uniform rejection.
                 # Reached only when even the target theta-bin is geometrically
                 # infeasible in this room, which shouldn't happen with the
-                # Lx/Ly swap guarantee unless the user fixed `mic_center` explicitly.
+                # y0-edge mic placement unless the user fixed `mic_center` explicitly.
                 r_arg_free = None if full_room_mode else (r_lo, r_hi)
                 for _ in range(max_src_tries):
                     cand = _try_place((0.0, 180.0), r_arg_free)
@@ -1995,14 +1972,14 @@ usage:
  Fixed room size list + matching mic centers (evenly distributed by index):
  python gen_rir.py --room_size_list '[[5,6,3],[6,7,3],[8,5,3]]' --mic_center_list '[[2.00,1.00,2.0],[2.00,1.00,2.0],[2.00,1.00,2.0]]' --mic_zlim '[1,2]' --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --rir_nums '[10000,500,500]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-fixed-room-list
 
- Edge mic on room perimeter (uniform along walls) + uniform (angle, radius):
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 1.5 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-edge-mic
+ Edge mic on y0 x-parallel edge only (y=mic_wall_offset, uniform x) + uniform (angle, radius):
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 0.4 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,3.0]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-edge-mic
 
  Uniform angle + full-room radius (no hard r_hi cap). spk_arr_dist[1]=null
  lets each source reach anywhere in the room from the mic at the target angle.
  The angle marginal is kept exactly flat by the theta round-robin; the radius
  marginal spans [0.3, r_max(theta)] where r_max varies with room size and angle.
- python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 1.5 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 0.4 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom
  # Or use the config file:
  python gen_rir.py -c /storage/reie/data/rec-rir/rir-uniform-angle-fullroom/config.json
 """

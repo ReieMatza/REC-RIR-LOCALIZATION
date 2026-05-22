@@ -1,12 +1,14 @@
 # @description: Render 2D top-down room layouts for RIR dataset samples with FiLM params.
 #
-# Loads RIR .npz files listed under a dataset config folder (e.g.
-# config/rir-uniform-angle-fullroom-edge), draws room outline, mic and source
-# positions, and annotates raw + normalized FiLM room parameters.
+# Loads RIR .npz files from either:
+#   - a dataset config folder with reie-{train,validation,test}-rir.txt lists, or
+#   - a raw generated dataset under data/rec-rir/... with train|validation|test/
+# draws room outline, mic and source positions, and annotates FiLM room parameters.
 #
 # Usage (from REC-RIR-LOCALIZATION):
 #   python visualize_dataset.py config/rir-uniform-angle-fullroom-edge -n 12 -o out/viz
 #   python visualize_dataset.py config/rir-uniform-angle-fullroom-edge --split test -n 5 --seed 0
+#   python visualize_dataset.py /storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge-y0-test -n 8
 
 from __future__ import annotations
 
@@ -48,6 +50,13 @@ SPLIT_TO_LIST = {
     "validation": "reie-validation-rir.txt",
     "val": "reie-validation-rir.txt",
     "test": "reie-test-rir.txt",
+}
+
+SPLIT_TO_SUBDIR = {
+    "train": "train",
+    "validation": "validation",
+    "val": "validation",
+    "test": "test",
 }
 
 
@@ -135,36 +144,96 @@ def _nearest_wall_label(x: float, y: float, Lx: float, Ly: float) -> str:
     return min(dists, key=dists.get)
 
 
+def _split_subdir(split: str) -> str:
+    subdir = SPLIT_TO_SUBDIR.get(split.lower())
+    if subdir is None:
+        raise ValueError(f"Unknown split {split!r}. Use train, validation, or test.")
+    return subdir
+
+
+def _collect_raw_rir_paths(dataset_dir: Path, split: str) -> List[str]:
+    """List .npz paths from a raw data/rec-rir/<name>/{train,validation,test}/ folder."""
+    subdir = _split_subdir(split)
+    split_dir = dataset_dir / subdir
+    if split_dir.is_dir():
+        paths = sorted(str(p.resolve()) for p in split_dir.glob("*.npz"))
+        if paths:
+            return paths
+
+    loc_csv = dataset_dir / "rir_localization.csv"
+    if loc_csv.is_file():
+        needle = f"/{subdir}/"
+        paths = []
+        with loc_csv.open("r", newline="") as handle:
+            for row in csv.DictReader(handle):
+                rir_path = row.get("rir_path", "").strip()
+                if rir_path and needle in Path(rir_path).as_posix():
+                    paths.append(rir_path)
+        if paths:
+            return sorted(paths)
+
+    raise FileNotFoundError(
+        f"No RIR .npz files for split {split!r} under {dataset_dir} "
+        f"(expected {split_dir}/{{*.npz}} or paths in {loc_csv})"
+    )
+
+
+def _is_raw_dataset_dir(dataset_dir: Path, split: str) -> bool:
+    """True when dataset_dir is a generated rec-rir folder, not a config list folder."""
+    list_name = SPLIT_TO_LIST.get(split.lower())
+    if list_name and (dataset_dir / list_name).is_file():
+        return False
+    subdir = _split_subdir(split)
+    if (dataset_dir / subdir).is_dir() and any((dataset_dir / subdir).glob("*.npz")):
+        return True
+    if (dataset_dir / "rir_localization.csv").is_file():
+        return True
+    return False
+
+
 def _resolve_dataset_paths(
     dataset_dir: Path,
     split: str,
     localization_csv: Optional[Path],
-) -> Tuple[Path, Path, Optional[Path]]:
+) -> Tuple[List[str], Path, Optional[Path], bool]:
+    """Return (rir_paths, localization_csv, gen_config, is_raw_dataset)."""
     dataset_dir = dataset_dir.expanduser().resolve()
     if not dataset_dir.is_dir():
-        raise FileNotFoundError(f"Dataset config dir not found: {dataset_dir}")
+        raise FileNotFoundError(f"Dataset dir not found: {dataset_dir}")
 
-    list_name = SPLIT_TO_LIST.get(split.lower())
-    if list_name is None:
-        raise ValueError(f"Unknown split {split!r}. Use train, validation, or test.")
-    rir_list = dataset_dir / list_name
-    if not rir_list.is_file():
-        raise FileNotFoundError(f"RIR list not found: {rir_list}")
+    _split_subdir(split)  # validate split name
+    is_raw = _is_raw_dataset_dir(dataset_dir, split)
 
-    if localization_csv is None:
-        # Default: data/rec-rir/<dataset-folder-name>/rir_localization.csv
-        localization_csv = (
-            Path("/storage/reie/data/rec-rir") / dataset_dir.name / "rir_localization.csv"
-        )
+    if is_raw:
+        rir_paths = _collect_raw_rir_paths(dataset_dir, split)
+        if localization_csv is None:
+            localization_csv = dataset_dir / "rir_localization.csv"
+        else:
+            localization_csv = localization_csv.expanduser().resolve()
+        gen_config = dataset_dir / "config.json"
+        gen_config = gen_config if gen_config.is_file() else None
     else:
-        localization_csv = localization_csv.expanduser().resolve()
+        list_name = SPLIT_TO_LIST[split.lower()]
+        rir_list = dataset_dir / list_name
+        if not rir_list.is_file():
+            raise FileNotFoundError(f"RIR list not found: {rir_list}")
+        rir_paths = _read_pathlist(rir_list)
+
+        if localization_csv is None:
+            localization_csv = (
+                Path("/storage/reie/data/rec-rir")
+                / dataset_dir.name
+                / "rir_localization.csv"
+            )
+        else:
+            localization_csv = localization_csv.expanduser().resolve()
+        gen_config = Path("/storage/reie/data/rec-rir") / dataset_dir.name / "config.json"
+        gen_config = gen_config if gen_config.is_file() else None
 
     if not localization_csv.is_file():
         raise FileNotFoundError(f"Localization CSV not found: {localization_csv}")
 
-    gen_config = Path("/storage/reie/data/rec-rir") / dataset_dir.name / "config.json"
-    gen_config = gen_config if gen_config.is_file() else None
-    return rir_list, localization_csv, gen_config
+    return rir_paths, localization_csv, gen_config, is_raw
 
 
 def render_sample(
@@ -323,8 +392,9 @@ def _parse_args(argv=None):
         "dataset_dir",
         type=str,
         help=(
-            "Dataset config folder containing reie-{train,validation,test}-rir.txt "
-            "(e.g. config/rir-uniform-angle-fullroom-edge)"
+            "Dataset config folder with reie-{train,validation,test}-rir.txt "
+            "(e.g. config/rir-uniform-angle-fullroom-edge), or a raw generated "
+            "dataset folder under data/rec-rir/... with train|validation|test/ subdirs"
         ),
     )
     parser.add_argument(
@@ -351,7 +421,10 @@ def _parse_args(argv=None):
         "--localization-csv",
         type=str,
         default=None,
-        help="Path to rir_localization.csv (default: data/rec-rir/<name>/rir_localization.csv)",
+        help=(
+            "Path to rir_localization.csv (default: <raw-dataset>/rir_localization.csv "
+            "or data/rec-rir/<config-name>/rir_localization.csv)"
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -379,7 +452,7 @@ def main(argv=None) -> int:
     loc_csv = Path(args.localization_csv) if args.localization_csv else None
 
     try:
-        rir_list_path, loc_path, gen_config_path = _resolve_dataset_paths(
+        paths, loc_path, gen_config_path, is_raw = _resolve_dataset_paths(
             dataset_dir, args.split, loc_csv
         )
     except (FileNotFoundError, ValueError) as exc:
@@ -393,15 +466,15 @@ def main(argv=None) -> int:
         if gen_cfg.get("mic_wall_offset") is not None:
             mic_wall_offset = float(gen_cfg["mic_wall_offset"])
 
+    split_key = _split_subdir(args.split)
     out_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
-        else (dataset_dir.resolve() / "renders" / args.split.lower())
+        else (dataset_dir.resolve() / "renders" / split_key)
     )
 
-    paths = _read_pathlist(rir_list_path)
     if not paths:
-        print(f"No RIR paths in {rir_list_path}", file=sys.stderr)
+        print(f"No RIR paths for split {args.split!r} in {dataset_dir}", file=sys.stderr)
         return 1
 
     n = max(1, args.num_samples)
@@ -417,8 +490,9 @@ def main(argv=None) -> int:
             chosen = [paths[i] for i in sorted(idx)]
 
     loc_map = _load_localization_map(loc_path)
-    print(f"Dataset:      {dataset_dir.resolve()}")
-    print(f"RIR list:     {rir_list_path}  ({len(paths)} total)")
+    dataset_kind = "raw" if is_raw else "config"
+    print(f"Dataset:      {dataset_dir.resolve()}  ({dataset_kind})")
+    print(f"RIR paths:    {len(paths)} for split {split_key!r}")
     print(f"Localization: {loc_path}")
     print(f"Output:       {out_dir}")
     print(f"Rendering {len(chosen)} sample(s)...")
