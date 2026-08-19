@@ -241,6 +241,7 @@ def render_sample(
     out_path: Path,
     localization: Optional[Tuple[float, float]],
     mic_wall_offset: Optional[float],
+    mic_edge_width: float = 0.0,
     title_extra: str = "",
 ) -> None:
     data = np.load(rir_path, allow_pickle=True)
@@ -274,6 +275,7 @@ def render_sample(
 
     if mic_wall_offset is not None:
         o = float(mic_wall_offset)
+        w = float(mic_edge_width)
         inner = Rectangle(
             (o, o),
             max(Lx - 2 * o, 0),
@@ -282,9 +284,21 @@ def render_sample(
             edgecolor="#888888",
             linewidth=1.0,
             linestyle="--",
-            label=f"mic perimeter (offset={o:.2f} m)",
+            label=f"mic inset (offset={o:.2f} m)",
         )
         ax_room.add_patch(inner)
+        if w > 0.0:
+            band = Rectangle(
+                (o, o),
+                max(Lx - 2 * o, 0),
+                w,
+                facecolor="#4393c3",
+                edgecolor="#2166ac",
+                alpha=0.2,
+                linewidth=1.0,
+                label=f"y0 band [{o:.2f}, {o + w:.2f}] m",
+            )
+            ax_room.add_patch(band)
 
     ax_room.scatter(
         pos_rcv[:, 0],
@@ -460,11 +474,13 @@ def main(argv=None) -> int:
         return 1
 
     mic_wall_offset: Optional[float] = None
+    mic_edge_width: float = 0.0
     if gen_config_path is not None:
         with gen_config_path.open("r") as handle:
             gen_cfg = json.load(handle)
         if gen_cfg.get("mic_wall_offset") is not None:
             mic_wall_offset = float(gen_cfg["mic_wall_offset"])
+        mic_edge_width = float(gen_cfg.get("mic_edge_width", 0.0) or 0.0)
 
     split_key = _split_subdir(args.split)
     out_dir = (
@@ -509,6 +525,7 @@ def main(argv=None) -> int:
             out_file,
             localization=loc,
             mic_wall_offset=mic_wall_offset,
+            mic_edge_width=mic_edge_width,
             title_extra=f"sample {i + 1}/{len(chosen)}  |  {dataset_dir.name}",
         )
         print(f"  saved {out_file}")

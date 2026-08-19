@@ -61,5 +61,9 @@ if __name__ == "__main__":
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/train -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-train-rir.txt -e .npz
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-validation-rir.txt -e .npz
     python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-ratio-center-multiple-rooms/test -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-ratio-center-multiple-rooms/reie-test-rir.txt -e .npz
+
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge/train -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-uniform-angle-fullroom-edge/reie-train-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge/validation -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-uniform-angle-fullroom-edge/reie-validation-rir.txt -e .npz
+    python gen_fpath_txt.py -i /storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge/test -o /storage/reie/REC-RIR-LOCALIZATION/config/rir-uniform-angle-fullroom-edge/reie-test-rir.txt -e .npz
     """
     
