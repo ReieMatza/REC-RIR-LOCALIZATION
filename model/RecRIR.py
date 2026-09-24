@@ -480,10 +480,12 @@ class BiSpatialNet(nn.Module):
         # ``use_film`` which controls FiLM at the embedding/heads only.
         use_film_ctf_layers: bool = False,
         film_ctf_layer_indices: Optional[List[int]] = None,
-        # If True, the new CTF FiLM modules are zero-initialised so that
-        # gamma=1, beta=0 at step 0 -> identity. Use this when warm-starting
-        # from a checkpoint without these modules so the warm-started CTF
-        # backbone isn't perturbed at step 0.
+        # If True, EVERY FiLM conditioner (CTF layers, embedding 1dconv, loc
+        # heads) is identity-initialised so gamma=1, beta=0 at step 0.
+        # Use when warm-starting from a checkpoint that has no FiLM (e.g.
+        # vendor epoch35) so the loaded trunk is not warped on the first
+        # forward. Does not apply to already-trained FiLM that is loaded
+        # from the checkpoint after __init__.
         film_identity_init: bool = False,
     ):
         super().__init__()
@@ -622,8 +624,12 @@ class BiSpatialNet(nn.Module):
 
         if self.embedding_type == "1dconv":
             if use_film:
-                self.film_embedding_conv1 = FiLMConditioner(num_room_params, dim_hidden)
-                self.film_embedding_conv2 = FiLMConditioner(num_room_params, dim_hidden)
+                self.film_embedding_conv1 = FiLMConditioner(
+                    num_room_params, dim_hidden, identity_init=film_identity_init
+                )
+                self.film_embedding_conv2 = FiLMConditioner(
+                    num_room_params, dim_hidden, identity_init=film_identity_init
+                )
             else:
                 self.film_embedding_conv1 = None
                 self.film_embedding_conv2 = None
@@ -648,10 +654,18 @@ class BiSpatialNet(nn.Module):
 
         self.use_film = use_film
         if use_film:
-            self.film_conditioner = FiLMConditioner(num_room_params, dim_embedding)
-            self.film_angle_1 = FiLMConditioner(num_room_params, 512)
-            self.film_angle_2 = FiLMConditioner(num_room_params, 256)
-            self.film_radius = FiLMConditioner(num_room_params, dim_embedding)
+            self.film_conditioner = FiLMConditioner(
+                num_room_params, dim_embedding, identity_init=film_identity_init
+            )
+            self.film_angle_1 = FiLMConditioner(
+                num_room_params, 512, identity_init=film_identity_init
+            )
+            self.film_angle_2 = FiLMConditioner(
+                num_room_params, 256, identity_init=film_identity_init
+            )
+            self.film_radius = FiLMConditioner(
+                num_room_params, dim_embedding, identity_init=film_identity_init
+            )
         else:
             self.film_conditioner = None
             self.film_angle_1 = None
