@@ -1,0 +1,155 @@
+# Trunk-only fine-tune on measured OpenSLR 28 RIRs.
+# Start from the 16.1deg CTF one-shot. Do not restart from epoch35.tar.
+#
+# -s /storage/reie/experiments/epoch35-straight-to-15m-2gpu/ckpt/best.tar
+#   Freeze: angle_fc*, radius_head, embedding_1dconv, every FiLM module.
+#   Train: encoder, speech/noise/CTF stacks, decoders.
+#   use_room_conditioning=false → room_params=None (FiLM not applied; weights stay).
+#   loss_w_angle = loss_w_radius = 0. cln/rvb/rec stay 1.
+#   Direct path is the ±2 ms peak cut inside gen_real_datapair.
+#
+# Data: OpenSLR 28 real_rirs_isotropic_noises only (RWCP, REVERB 2014, AIR).
+#   Not simulated_rirs. Not the noise wavs. Not the filtered BUT test tree.
+#   Archive lives on the node disk because /storage is full:
+#   /root/data/openslr28/
+# Room-held-out split, seed 2024: 293 train / 32 val (14 rooms, 9.8%).
+# Lists: /root/data/openslr28/reie-train-rir.txt and reie-validation-rir.txt.
+# best_metric=total (reconstruction).
+#
+# Ada 2 GPU: [4,4,1] → 2/GPU, 3457 steps/epoch (same speech list as the one-shot).
+# 8 epochs, lr=1e-4, T_max=27656. ~22 min/epoch × 8 ≈ 3 h.
+# num_workers=4, prefetch=1, persistent_workers=false (64 MB /dev/shm).
+#
+# After training, BUT-eval this -p/ckpt/best.tar on the same 45-room slice.
+# Parent 38.5deg / 1.63 m → this run 26.2deg / 1.87 m.
+#
+# Do NOT -r the one-shot -p into this run.
+#
+# Usage (2x RTX 6000 Ada):
+#   cd /storage/reie/REC-RIR-LOCALIZATION
+#   /storage/reie/.venv_custom_ssh/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 train.py \
+#     -c config/Rec-RIR-heads-only-epoch35-straight-to-15m-openslr-real-2gpu.toml \
+#     -p /root/experiments/epoch35-straight-to-15m-openslr-real-2gpu \
+#     -s /storage/reie/experiments/epoch35-straight-to-15m-2gpu/ckpt/best.tar
+#
+# Resume later: -r same -p, no -s.
+
+[meta]
+seed = 2024
+cudnn_enable = true
+use_torch_compile = false
+freeze_loc_readout = true
+
+[wandb]
+project = "rec-rir-localization"
+entity = ""
+name = ""
+tags = ["training", "rec-rir", "openslr28", "real-rir", "trunk-only", "freeze-loc", "a6000", "2gpu"]
+notes = "Trunk fine-tune from straight-to-15m best.tar on OpenSLR 28 measured RIRs only. Loc heads and FiLM frozen, room_params=None, loc losses 0. 8 ep lr=1e-4. Re-eval BUT 45-room vs 38.5deg/1.63m."
+mode = "online"
+
+[acoustic]
+path = "acoustics.feature.transforms"
+
+[dataloader]
+path = "dataset.dataset_RecRIR.MyDataloader"
+
+[optimizer]
+type = "AdamW"
+
+[scheduler]
+type = "CosineAnnealingLR"
+
+[trainer]
+path = "trainer_inferencer.trainer_RecRIR.Trainer"
+
+[model]
+path = "model.RecRIR.BiSpatialNet"
+
+[EM_algo]
+path = "method.pim.PIM"
+
+[acoustic.args]
+sr = 16000
+n_fft = 512
+win_len = 512
+hop_len = 256
+win_type = "sqrthann"
+
+[dataloader.args]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
+rir_pathlist = [ "/root/data/openslr28/reie-train-rir.txt", "/root/data/openslr28/reie-validation-rir.txt", "/root/data/openslr28/reie-validation-rir.txt",]
+noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+snr_range = [ 5, 20,]
+seq_lenlist = [ 4.0, 6.0, 4.0,]
+batchsize = [ 4, 4, 1,]
+num_workers = 4
+seeds = [ 2022, 2023, 2024,]
+pin_memory = true
+prefetch_factor = 1
+persistent_workers = false
+rank = 0
+sr = 16000
+noisy_proportion = 1
+use_room_conditioning = false
+
+[optimizer.args]
+lr = 0.0001
+
+[scheduler.args]
+T_max = 27_656
+eta_min = 1e-6
+
+[trainer.train]
+epochs = 8
+clip_grad_norm_value = 1
+save_ckpt_interval = 1
+loss_w_cln = 1.0
+loss_w_rvb = 1.0
+loss_w_rec = 1.0
+loss_w_angle = 0.0
+loss_w_radius = 0.0
+loss_type = "RIMag"
+angle_label_smoothing_sigma = 10.0
+radius_label_smoothing_sigma = 2.0
+retain_graph = false
+
+[trainer.validation]
+interval = 1
+save_max_metric = false
+best_metric = "total"
+best_metric_radius_weight = 10.0
+
+[model.args]
+dim_input = 2
+dim_output_spch = 2
+dim_output_CTF = 120
+dim_hidden = 96
+dim_squeeze = 8
+num_freqs = 257
+num_layers_spch = 6
+num_layers_noise = 2
+num_layers_CTF = 6
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+encoder_kernel_size = 5
+dropout = [ 0, 0, 0,]
+kernel_size = [ 5, 3,]
+conv_groups = [ 8, 8,]
+norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
+full_share = 0
+attention = "mamba(16,4)"
+use_film = true
+num_room_params = 8
+embedding_type = "1dconv"
+embedding_1dconv_kernel = 5
+use_film_ctf_layers = true
+film_ctf_layer_indices = [ 0, 1, 2, 3, 4, 5,]
+film_identity_init = false
+
+[EM_algo.args]
+sr = 16000

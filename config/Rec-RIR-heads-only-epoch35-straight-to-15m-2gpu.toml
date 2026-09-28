@@ -1,0 +1,148 @@
+# One-shot: vendor epoch35.tar → 15 m edge data in ONE unfrozen job.
+# 2x RTX 6000 Ada. Parent of the OpenSLR trunk fine-tune
+# (Rec-RIR-heads-only-epoch35-straight-to-15m-openslr-real-2gpu.toml).
+#
+# -s REC-RIR-LOCALIZATION/ckpt/epoch35.tar
+#   Keep: encoder, spch/noise/CTF, decoders.
+#   Missing (fresh): angle_fc*, radius_head (53 = 13.0/0.25), embedding_1dconv,
+#     encoder/head FiLM, CTF FiLM. film_identity_init=true → ALL FiLM identity
+#     at step 0 (not CTF-only; that was the 41deg bug).
+#   Train whole net + cln/rvb/rec + loc. Keep RIR losses = 1.
+#
+# Data: rir-uniform-angle-fullroom-edge-y0-band-min03-ow02 (seed-2024).
+#   NOT s2026. Third rir pathlist is TEST.
+# Ada: [4,4,1] -> 2/GPU, 3457 steps/epoch. T_max=139971 (~ep 40.5 floor).
+# 60 ep, lr=5e-4. ~22 min/epoch × 60 ≈ 22 h. Expect best ~ep 40; after the
+# floor hop 5 historically got worse. Kill if no new best by ~ep 42-45 and drifting.
+#
+# Use ckpt/best.tar, not last epoch. BUT 45-room: 38.5deg / 1.63 m.
+#
+# Usage (2x RTX 6000 Ada):
+#   cd /storage/reie/REC-RIR-LOCALIZATION
+#   /storage/reie/.venv_custom_ssh/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 train.py \
+#     -c config/Rec-RIR-heads-only-epoch35-straight-to-15m-2gpu.toml \
+#     -p /storage/reie/experiments/epoch35-straight-to-15m-2gpu \
+#     -s /storage/reie/REC-RIR-LOCALIZATION/ckpt/epoch35.tar
+#
+# Resume later: -r same -p, no -s.
+
+[meta]
+seed = 2024
+cudnn_enable = true
+use_torch_compile = false
+
+[wandb]
+project = "rec-rir-localization"
+entity = ""
+name = ""
+tags = ["training", "rec-rir", "epoch35", "straight-to-15m", "hop5", "identity-film", "fullroom", "edge-mic", "y0-band", "min03-ow02", "a6000", "2gpu"]
+notes = "One-shot: epoch35.tar unfrozen on seed-2024 15m edge. Identity ALL FiLM. Radius 13.0/0.25 (53 cls). 60 ep T_max=139971."
+mode = "online"
+
+[acoustic]
+path = "acoustics.feature.transforms"
+
+[dataloader]
+path = "dataset.dataset_RecRIR.MyDataloader"
+
+[optimizer]
+type = "AdamW"
+
+[scheduler]
+type = "CosineAnnealingLR"
+
+[trainer]
+path = "trainer_inferencer.trainer_RecRIR.Trainer"
+
+[model]
+path = "model.RecRIR.BiSpatialNet"
+
+[EM_algo]
+path = "method.pim.PIM"
+
+[acoustic.args]
+sr = 16000
+n_fft = 512
+win_len = 512
+hop_len = 256
+win_type = "sqrthann"
+
+[dataloader.args]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
+rir_pathlist = [ "config/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02/reie-train-rir.txt", "config/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02/reie-validation-rir.txt", "config/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02/reie-test-rir.txt",]
+noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
+localization_csv = "/storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02/rir_localization.csv"
+localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+snr_range = [ 5, 20,]
+seq_lenlist = [ 4.0, 6.0, 4.0,]
+batchsize = [ 4, 4, 1,]
+num_workers = 8
+seeds = [ 2022, 2023, 2024,]
+pin_memory = true
+prefetch_factor = 2
+persistent_workers = true
+rank = 0
+sr = 16000
+noisy_proportion = 1
+use_room_conditioning = true
+
+[optimizer.args]
+lr = 0.0005
+
+[scheduler.args]
+T_max = 139_971
+eta_min = 1e-6
+
+[trainer.train]
+epochs = 60
+clip_grad_norm_value = 1
+save_ckpt_interval = 1
+loss_w_cln = 1.0
+loss_w_rvb = 1.0
+loss_w_rec = 1.0
+loss_w_angle = 1.0
+loss_w_radius = 1.0
+loss_type = "RIMag"
+angle_label_smoothing_sigma = 10.0
+radius_label_smoothing_sigma = 2.0
+retain_graph = true
+
+[trainer.validation]
+interval = 1
+save_max_metric = false
+best_metric = "localization"
+best_metric_radius_weight = 10.0
+
+[model.args]
+dim_input = 2
+dim_output_spch = 2
+dim_output_CTF = 120
+dim_hidden = 96
+dim_squeeze = 8
+num_freqs = 257
+num_layers_spch = 6
+num_layers_noise = 2
+num_layers_CTF = 6
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+encoder_kernel_size = 5
+dropout = [ 0, 0, 0,]
+kernel_size = [ 5, 3,]
+conv_groups = [ 8, 8,]
+norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
+full_share = 0
+attention = "mamba(16,4)"
+use_film = true
+num_room_params = 8
+embedding_type = "1dconv"
+embedding_1dconv_kernel = 5
+use_film_ctf_layers = true
+film_ctf_layer_indices = [ 0, 1, 2, 3, 4, 5,]
+film_identity_init = true
+
+[EM_algo.args]
+sr = 16000
