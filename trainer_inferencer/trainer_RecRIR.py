@@ -139,6 +139,12 @@ class Trainer(BaseTrainer):
         self.best_metric_radius_weight = float(
             validation_cfg.get("best_metric_radius_weight", 10.0)
         )
+        self.retain_graph = bool(train_cfg.get("retain_graph", True))
+        # use_room_conditioning=false means the RIRs have no room geometry
+        # (measured RIRs): skip FiLM so a zero code is not applied.
+        self.apply_room_film = bool(
+            config["dataloader"]["args"].get("use_room_conditioning", True)
+        )
 
     def _train_epoch(self, epoch):
 
@@ -157,6 +163,8 @@ class Trainer(BaseTrainer):
                 angle_class = angle_class.to(self.rank)
                 radius_class = radius_class.to(self.rank)
                 room_params = room_params.to(self.rank) if room_params is not None else None
+                if not self.apply_room_film:
+                    room_params = None
 
                 input_complex = self.transformfunc.stft(
                     noisy_wav, output_type="complex"
@@ -219,7 +227,7 @@ class Trainer(BaseTrainer):
                     + self.loss_w_radius * loss_radius
                 )
 
-            self.scaler.scale(loss_gd).backward(retain_graph=True)
+            self.scaler.scale(loss_gd).backward(retain_graph=self.retain_graph)
 
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.clip_grad_norm_value
@@ -284,6 +292,8 @@ class Trainer(BaseTrainer):
             angle_class = angle_class.to(self.rank)
             radius_class = radius_class.to(self.rank)
             room_params = room_params.to(self.rank) if room_params is not None else None
+            if not self.apply_room_film:
+                room_params = None
 
             input_complex = self.transformfunc.stft(noisy_wav, output_type="complex")
             target_complex = self.transformfunc.stft(dp_wav, output_type="complex")

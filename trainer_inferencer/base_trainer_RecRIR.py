@@ -265,6 +265,9 @@ class BaseTrainer:
             ckpt["model"], self.model.state_dict(), logger=self.rank == 0
         )
         self.model.load_state_dict(ckpt["model"], strict=False)
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if self.scheduler is not None and ckpt.get("scheduler") is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler"])
 
         if self.rank == 0:
             self.logger.info(

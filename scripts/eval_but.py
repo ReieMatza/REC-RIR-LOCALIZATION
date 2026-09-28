@@ -2,30 +2,26 @@
 """
 eval_but.py  —  Localization evaluation on BUT ReverbDB real-room RIRs.
 
-Reads the matched BUT CSV produced by match_but_dataset.py, builds a
-speech-convolution dataset (multiple speech clips per RIR), runs the trained
-BiSpatialNet model, and produces the same confusion-matrix / MAE artefacts as
-confusion_matrix.py, plus a per-entry prediction CSV for detailed inspection.
+Builds a speech-convolution dataset (multiple speech clips per RIR), runs the
+trained BiSpatialNet model, and produces the same confusion-matrix / MAE
+artefacts as confusion_matrix.py, plus a per-entry prediction CSV.
 
-The critical difference from the standard evaluation pipeline is that room_params
-(needed for FiLM conditioning) are derived directly from CSV metadata columns
-instead of being read from the synthetic .npz files.
+room_params (FiLM conditioning) come from metadata rather than synthetic .npz
+files.  Edit the variables in main() to choose:
+
+  dataset_root  filtered-and-rotated BUT tree (rotated_metadata.json + RIR/*.wav)
+  but_csv       legacy matched CSV (e.g. ACE single-sample feed); used only
+                when dataset_root is None
 
 Usage:
   cd /storage/reie/REC-RIR-LOCALIZATION
-  python scripts/eval_but.py \\
-      -c config/Rec-RIR-heads-only-fullroom-y0.toml \\
-      -k /storage/reie/experiments/<exp>/ckpt/best.tar \\
-      --out_dir results/but_eval
-
-Full options:
-  python scripts/eval_but.py --help
+  python scripts/eval_but.py
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
+import json
 import math
 import os
 import sys
@@ -114,33 +110,19 @@ def estimate_rt60_from_rir(rir: torch.Tensor, sr: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# room_params from CSV row
+# room_params from metadata
 # ---------------------------------------------------------------------------
 
-def compute_room_params_from_row(
-    row: Dict[str, str],
-    rt60_override: Optional[float] = None,
+def _compute_room_params(
+    rt60: float,
+    Lx: float,
+    Ly: float,
+    Lz: float,
+    mx: float,
+    my: float,
+    mz: float,
 ) -> torch.Tensor:
-    """Build the 8-element room_params tensor from a but_matched.csv row.
-
-    Replicates MyDataset._extract_room_params (dataset_RecRIR.py lines
-    151-180) using CSV columns instead of npz fields.
-
-    The training model (fullroom-edge-y0) always places the mic near the
-    y=0 wall, so room_sz=[Lx,Ly,Lz] and mic_center=[mx,my,mz] with my
-    small.  BUT mics can sit near any of the four walls.  We rotate the
-    horizontal plane so the near-wall axis always becomes y (index 1),
-    matching compute_angle_radius_local() in match_but_dataset.py which
-    builds angle labels in the same local frame.
-
-    Wall → training-frame mapping (BUT depth=x-axis, width=y-axis):
-        depth0   : Lx=room_width,  Ly=room_depth,  mx=mic_w,  my=mic_d
-        depthMax : Lx=room_width,  Ly=room_depth,  mx=mic_w,  my=room_d−mic_d
-        width0   : Lx=room_depth,  Ly=room_width,  mx=mic_d,  my=mic_w  [identity]
-        widthMax : Lx=room_depth,  Ly=room_width,  mx=mic_d,  my=room_w−mic_w
-
-    If rt60_override is not None it replaces the CSV 'rt60' column value,
-    allowing the caller to supply an RT60 estimated directly from the RIR.
+    """Build the 8-element FiLM vector. Matches MyDataset._extract_room_params.
 
     Vector layout:
         [0]   rt60_norm           clip((RT60 - 0.1) / 1.4,       0, 1)
@@ -148,40 +130,15 @@ def compute_room_params_from_row(
         [4-6] mic_center_norm     clip([mx/Lx, my/Ly, mz/Lz],    0, 1)
         [7]   volume_norm         clip((ln(vol)−ln10)/(ln1000−ln10), 0, 1)
     """
-    rt60 = rt60_override if (rt60_override is not None and math.isfinite(rt60_override)) \
-           else float(row["rt60"])
-    room_d = float(row["room_depth"])
-    room_w = float(row["room_width"])
-    room_h = float(row["room_height"])
-    mic_d  = float(row["mic_depth"])
-    mic_w  = float(row["mic_width"])
-    mic_h  = float(row["mic_height"])
-    nearest_wall = row["nearest_wall"].strip()
-
-    # Rotate horizontal axes so the near-wall direction maps to y (index 1),
-    # matching the training data convention.
-    # if nearest_wall == "depth0":
-    #     Lx, Ly = room_w, room_d
-    #     mx, my = mic_w, mic_d
-    # elif nearest_wall == "depthMax":
-    Lx, Ly = room_w, room_d
-    mx, my = room_w - mic_w, mic_d
-    # elif nearest_wall == "width0":
-    #     Lx, Ly = room_d, room_w
-    #     mx, my = mic_d, mic_w
-    # else:  # widthMax
-    #     Lx, Ly = room_d, room_w
-    #     mx, my = mic_d, room_w - mic_w
-
     rt60_norm = float(np.clip((rt60 - _RT60_MIN) / (_RT60_MAX - _RT60_MIN), 0.0, 1.0))
 
-    room_sz = np.array([Lx, Ly, room_h], dtype=np.float64)
+    room_sz = np.array([Lx, Ly, Lz], dtype=np.float64)
     room_sz_norm = np.clip(room_sz / _ROOM_SZ_MAX, 0.0, 1.0)
 
-    mic_center = np.array([mx, my, mic_h], dtype=np.float64)
+    mic_center = np.array([mx, my, mz], dtype=np.float64)
     mic_center_norm = np.clip(mic_center / (room_sz + _EPS), 0.0, 1.0)
 
-    volume_m3 = room_d * room_w * room_h  # volume is rotation-invariant
+    volume_m3 = Lx * Ly * Lz
     log_vol = math.log(max(volume_m3, _EPS))
     volume_norm = float(np.clip(
         (log_vol - _LOG_VOL_MIN) / (_LOG_VOL_MAX - _LOG_VOL_MIN), 0.0, 1.0
@@ -191,6 +148,227 @@ def compute_room_params_from_row(
         [[rt60_norm], room_sz_norm, mic_center_norm, [volume_norm]]
     ).astype(np.float32)
     return torch.from_numpy(params)  # [8]
+
+
+def compute_room_params_from_row(
+    row: Dict[str, str],
+    rt60_override: Optional[float] = None,
+) -> torch.Tensor:
+    """Build room_params from a dataset entry dict.
+
+    Rotated-BUT entries already store training-frame geometry in
+    room_sz_{x,y,z} / mic_{x,y,z} — use those directly.
+
+    Legacy CSV rows (ACE / match_but_dataset.py) use room_depth/width and
+    a nearest-wall remap.  The ACE single-sample feed hard-codes the
+    depthMax-style mapping used when that CSV was produced.
+    """
+    rt60 = rt60_override if (rt60_override is not None and math.isfinite(rt60_override)) \
+           else float(row["rt60"])
+
+    if row.get("room_sz_x"):
+        return _compute_room_params(
+            rt60,
+            float(row["room_sz_x"]),
+            float(row["room_sz_y"]),
+            float(row["room_sz_z"]),
+            float(row["mic_x"]),
+            float(row["mic_y"]),
+            float(row["mic_z"]),
+        )
+
+    room_d = float(row["room_depth"])
+    room_w = float(row["room_width"])
+    room_h = float(row["room_height"])
+    mic_d  = float(row["mic_depth"])
+    mic_w  = float(row["mic_width"])
+    mic_h  = float(row["mic_height"])
+
+    # ACE CSV fallback: keep the mapping used when but_matched.csv was written.
+    Lx, Ly = room_w, room_d
+    mx, my = room_w - mic_w, mic_d
+    return _compute_room_params(rt60, Lx, Ly, room_h, mx, my, mic_h)
+
+
+def compute_angle_radius_rotated(
+    source_x: float,
+    source_y: float,
+    mic_x: float,
+    mic_y: float,
+) -> Tuple[float, float]:
+    """Folded angle [0, 180] and horizontal radius in the training frame.
+
+    Matches gen_rir.py::compute_angle_radius with half-space restriction:
+    angle = atan2(Δy, Δx) % 360, then fold angles > 180.
+    """
+    dx = source_x - mic_x
+    dy = source_y - mic_y
+    radius_m = math.hypot(dx, dy)
+    angle_deg = math.degrees(math.atan2(dy, dx)) % 360.0
+    if angle_deg > 180.0:
+        angle_deg = 360.0 - angle_deg
+    return angle_deg, radius_m
+
+
+def latest_rir_wav(sample_dir: Path) -> Optional[Path]:
+    """Lexicographically last *.wav in sample_dir/RIR/ (highest v## index)."""
+    rir_dir = sample_dir / "RIR"
+    if not rir_dir.is_dir():
+        return None
+    wavs = sorted(rir_dir.glob("*.wav"))
+    return wavs[-1] if wavs else None
+
+
+def load_rotated_but_entries(root: Path) -> List[Dict[str, str]]:
+    """Walk a filtered-and-rotated BUT tree and build ButRirDataset entries.
+
+    Each sample is ``<room>/<mic>/<speaker>/`` with ``rotated_metadata.json``
+    and ``RIR/*.wav``.  Coordinates in ``rotated`` are already in the training
+    frame (mic near y=0).
+    """
+    meta_paths = sorted(root.rglob("rotated_metadata.json"))
+    if not meta_paths:
+        raise ValueError(f"No rotated_metadata.json files under {root}")
+
+    entries: List[Dict[str, str]] = []
+    skipped: List[str] = []
+    for meta_path in meta_paths:
+        sample_dir = meta_path.parent
+        wav = latest_rir_wav(sample_dir)
+        if wav is None:
+            skipped.append(str(sample_dir))
+            continue
+
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        rot = meta["rotated"]
+        env = meta.get("environment") or {}
+        scenario = meta.get("scenario") or {}
+        rotation = meta.get("rotation") or {}
+
+        angle_deg, radius_m = compute_angle_radius_rotated(
+            float(rot["source_x"]),
+            float(rot["source_y"]),
+            float(rot["mic_x"]),
+            float(rot["mic_y"]),
+        )
+        entries.append({
+            "rir_path": str(wav.resolve()),
+            "angle_deg": f"{angle_deg:.4f}",
+            "radius_m": f"{radius_m:.4f}",
+            "rt60": str(rot["RT60"]),
+            "room_sz_x": str(rot["room_sz_x"]),
+            "room_sz_y": str(rot["room_sz_y"]),
+            "room_sz_z": str(rot["room_sz_z"]),
+            "mic_x": str(rot["mic_x"]),
+            "mic_y": str(rot["mic_y"]),
+            "mic_z": str(rot["mic_z"]),
+            "source_x": str(rot["source_x"]),
+            "source_y": str(rot["source_y"]),
+            "source_z": str(rot["source_z"]),
+            "room": str(env.get("env_name", sample_dir.parent.parent.name)),
+            "mic_id": str(scenario.get("microphone", sample_dir.parent.name)),
+            "spk_setup": str(scenario.get("speaker", sample_dir.name)),
+            "applied_rotation": str(rotation.get("mode", "")),
+        })
+
+    if skipped:
+        print(f"[warn] skipped {len(skipped)} samples with no RIR wav:")
+        for s in skipped:
+            print(f"  {s}")
+    if not entries:
+        raise ValueError(f"No usable RIR samples under {root}")
+    return entries
+
+
+def _split_by_model_radius_range(
+    entries: List[Dict[str, str]],
+    max_rad_value: float,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Tag entries with in_model_range and split on the model's radius cap.
+
+    The cut is the config/checkpoint ``max_rad_value`` (not a hardcoded metre
+    limit), so a different model filters itself.
+    """
+    in_range: List[Dict[str, str]] = []
+    oor: List[Dict[str, str]] = []
+    for row in entries:
+        try:
+            keep = float(row["radius_m"]) <= max_rad_value
+        except (KeyError, TypeError, ValueError):
+            keep = False
+        row["in_model_range"] = "1" if keep else "0"
+        (in_range if keep else oor).append(row)
+    return in_range, oor
+
+
+def _entry_room_volume_m3(row: Dict[str, str]) -> Optional[float]:
+    """Room volume from rotated room_sz_* or legacy depth/width/height columns."""
+    try:
+        if row.get("room_sz_x"):
+            return (
+                float(row["room_sz_x"])
+                * float(row["room_sz_y"])
+                * float(row["room_sz_z"])
+            )
+        return (
+            float(row["room_depth"])
+            * float(row["room_width"])
+            * float(row["room_height"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _entry_room_dims_m(row: Dict[str, str]) -> Optional[Tuple[float, float, float]]:
+    """(Lx, Ly, Lz) from rotated or legacy CSV columns."""
+    try:
+        if row.get("room_sz_x"):
+            return (
+                float(row["room_sz_x"]),
+                float(row["room_sz_y"]),
+                float(row["room_sz_z"]),
+            )
+        return (
+            float(row["room_width"]),
+            float(row["room_depth"]),
+            float(row["room_height"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _split_by_film_volume_range(
+    entries: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Keep rooms whose FiLM volume / size channels are not saturated.
+
+    Uses the same windows as ``_compute_room_params`` / MyDataset:
+      volume in [exp(_LOG_VOL_MIN), exp(_LOG_VOL_MAX)] = [10, 1000] m^3
+      each room dim <= _ROOM_SZ_MAX (15 m)
+
+    These are the normalisation constants the model was trained with, not a
+    separate hardcoded eval cut — change the FiLM constants and the filter
+    follows.
+    """
+    vol_min = math.exp(_LOG_VOL_MIN)
+    vol_max = math.exp(_LOG_VOL_MAX)
+    in_range: List[Dict[str, str]] = []
+    oor: List[Dict[str, str]] = []
+    for row in entries:
+        vol = _entry_room_volume_m3(row)
+        dims = _entry_room_dims_m(row)
+        keep = (
+            vol is not None
+            and dims is not None
+            and vol_min <= vol <= vol_max
+            and max(dims) <= _ROOM_SZ_MAX
+        )
+        row["in_volume_range"] = "1" if keep else "0"
+        if vol is not None:
+            row["volume_m3"] = f"{vol:.4f}"
+        (in_range if keep else oor).append(row)
+    return in_range, oor
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +737,8 @@ def _save_head(
 def run(
     config_path: Path,
     checkpoint_path: Path,
-    but_csv: Path,
+    but_csv: Optional[Path],
+    dataset_root: Optional[Path],
     speech_txt: Path,
     noise_txt: Optional[Path],
     clips_per_rir: int,
@@ -573,6 +752,7 @@ def run(
     batch_size: int,
     num_workers: int,
     seed: int,
+    filter_to_film_volume_range: bool = True,
 ) -> None:
     # ── Setup ────────────────────────────────────────────────────────────────
     if device_str == "cuda" and not torch.cuda.is_available():
@@ -612,11 +792,85 @@ def run(
         config["acoustic"]["path"], config["acoustic"]["args"]
     )
 
-    # ── Read BUT CSV ─────────────────────────────────────────────────────────
-    with open(but_csv, newline="", encoding="utf-8") as f:
-        entries = list(csv.DictReader(f))
-    print(f"BUT CSV: {but_csv}  ({len(entries)} entries × {clips_per_rir} clips = "
-          f"{len(entries) * clips_per_rir} total samples)")
+    # ── Read entries ─────────────────────────────────────────────────────────
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if dataset_root is not None:
+        entries = load_rotated_but_entries(dataset_root)
+        data_src = f"dataset_root={dataset_root}"
+    else:
+        if but_csv is None:
+            raise ValueError("Either dataset_root or but_csv must be provided.")
+        with open(but_csv, newline="", encoding="utf-8") as f:
+            entries = list(csv.DictReader(f))
+        data_src = f"but_csv={but_csv}"
+
+    n_loaded = len(entries)
+    # Tag radius-range + volume-range on the full table before dropping anything.
+    _, _ = _split_by_model_radius_range(entries, max_rad_value)
+    _, _ = _split_by_film_volume_range(entries)
+
+    if dataset_root is not None and entries:
+        entries_csv = out_dir / "rotated_entries.csv"
+        fieldnames = list(entries[0].keys())
+        with open(entries_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(entries)
+        print(f"Wrote loaded entries: {entries_csv}")
+
+    in_range_entries, oor_entries = _split_by_model_radius_range(entries, max_rad_value)
+    n_skipped_oor = len(oor_entries)
+    if oor_entries:
+        print(
+            f"Skipping {n_skipped_oor}/{n_loaded} RIRs with radius_m > "
+            f"{max_rad_value:g} m (model max_rad_value):"
+        )
+        for row in oor_entries:
+            print(
+                f"  {row.get('room', '')} {row.get('mic_id', '')} "
+                f"{row.get('spk_setup', '')}  radius={row['radius_m']} m  "
+                f"{row.get('rir_path', '')}"
+            )
+    entries = in_range_entries
+    n_after_radius = len(entries)
+
+    n_skipped_vol = 0
+    vol_min = math.exp(_LOG_VOL_MIN)
+    vol_max = math.exp(_LOG_VOL_MAX)
+    if filter_to_film_volume_range:
+        vol_ok, vol_oor = _split_by_film_volume_range(entries)
+        n_skipped_vol = len(vol_oor)
+        if vol_oor:
+            print(
+                f"Skipping {n_skipped_vol}/{n_after_radius} RIRs outside FiLM volume "
+                f"window [{vol_min:g}, {vol_max:g}] m^3 or with a room dim > "
+                f"{_ROOM_SZ_MAX:g} m:"
+            )
+            for row in vol_oor:
+                print(
+                    f"  {row.get('room', '')} {row.get('mic_id', '')} "
+                    f"{row.get('spk_setup', '')}  vol={row.get('volume_m3', '?')} m^3  "
+                    f"dims=({row.get('room_sz_x') or row.get('room_width')},"
+                    f"{row.get('room_sz_y') or row.get('room_depth')},"
+                    f"{row.get('room_sz_z') or row.get('room_height')})  "
+                    f"{row.get('rir_path', '')}"
+                )
+        entries = vol_ok
+
+    if not entries:
+        raise ValueError(
+            "No RIR entries left after radius / FiLM-volume filters "
+            f"(max_rad_value={max_rad_value:g} m, "
+            f"volume=[{vol_min:g}, {vol_max:g}] m^3)."
+        )
+    print(
+        f"BUT data: {data_src}  "
+        f"({n_loaded} loaded, {n_after_radius} radius-in-range, "
+        f"{len(entries)} after volume filter, "
+        f"{n_skipped_oor} radius-OOR, {n_skipped_vol} volume-OOR; "
+        f"{len(entries)} × {clips_per_rir} clips = "
+        f"{len(entries) * clips_per_rir} total samples)"
+    )
 
     # ── Speech + noise paths ─────────────────────────────────────────────────
     with open(speech_txt, encoding="utf-8") as f:
@@ -629,7 +883,7 @@ def run(
             noise_paths = [os.path.normpath(l.strip()) for l in f if l.strip()]
         print(f"Noise paths: {len(noise_paths)} files (noisy_proportion={noisy_proportion})")
     else:
-        print("Noise: disabled (--noise_txt not provided)")
+        print("Noise: disabled (noise_txt is None)")
 
     # ── Build dataset & dataloader ────────────────────────────────────────────
     dataset = ButRirDataset(
@@ -725,7 +979,6 @@ def run(
     pbar.close()
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_name = checkpoint_path.name
 
     angle_stats = _save_head(
@@ -753,7 +1006,16 @@ def run(
         f"=====================================",
         f"config:          {config_path}",
         f"checkpoint:      {checkpoint_path}",
-        f"but_csv:         {but_csv}  ({len(entries)} RIR entries)",
+        f"data:            {data_src}",
+        f"max_rad_value_m:         {max_rad_value}",
+        f"film_volume_m3:          [{vol_min:g}, {vol_max:g}]",
+        f"film_room_sz_max_m:      {_ROOM_SZ_MAX}",
+        f"filter_to_film_volume:   {filter_to_film_volume_range}",
+        f"rir_entries_loaded:      {n_loaded}",
+        f"rir_entries_radius_ok:   {n_after_radius}",
+        f"rir_entries_skipped_oor: {n_skipped_oor}",
+        f"rir_entries_vol_ok:      {len(entries)}",
+        f"rir_entries_skipped_vol: {n_skipped_vol}",
         f"clips_per_rir:   {clips_per_rir}",
         f"total_samples:   {seen}",
         f"seq_len:         {seq_len} s",
@@ -784,161 +1046,102 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Entry point — edit these variables, then run: python scripts/eval_but.py
 # ---------------------------------------------------------------------------
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def main() -> None:
+    project_root = Path(__file__).resolve().parent.parent
 
-    # ── required / model ───────────────────────────────────────────────────
-    p.add_argument(
-        "-c", "--config",
-        type=Path,
-        required=True,
-        help="Path to training config .toml (e.g. config/Rec-RIR-heads-only-fullroom-y0.toml)",
-    )
-    p.add_argument(
-        "-k", "--checkpoint",
-        type=Path,
-        required=True,
-        help="Path to model checkpoint .tar",
-    )
+    # ── models ─────────────────────────────────────────────────────────────
+    # Both jobs use the one-shot toml: the OpenSLR fine-tune toml sets
+    # use_room_conditioning=false, but BUT eval must keep FiLM on.
+    one_shot_toml = project_root / "config/Rec-RIR-heads-only-epoch35-straight-to-15m-2gpu.toml"
+    jobs = [
+        (
+            one_shot_toml,
+            Path("/storage/reie/experiments/epoch35-straight-to-15m-2gpu/ckpt/best.tar"),
+            project_root / "results/but_epoch35_straight_to_15m",
+        ),
+        (
+            one_shot_toml,
+            Path("/root/experiments/epoch35-straight-to-15m-openslr-real-2gpu/ckpt/best.tar"),
+            Path("/root/experiments/epoch35-straight-to-15m-openslr-real-2gpu/but_45room"),
+        ),
+    ]
 
     # ── data ───────────────────────────────────────────────────────────────
-    p.add_argument(
-        "--but_csv",
-        type=Path,
-        default=Path("config/but_matched.csv"),
-        help="BUT matched CSV (default: config/but_matched.csv)",
-    )
-    p.add_argument(
-        "--speech_txt",
-        type=Path,
-        default=Path("config/reie_train_speech_quick.txt"),
-        help="Speech pathlist .txt (default: config/reie_train_speech_quick.txt)",
-    )
-    p.add_argument(
-        "--noise_txt",
-        type=Path,
-        default=None,
-        help="Noise pathlist .txt; omit to disable noise (default: None)",
-    )
-    p.add_argument(
-        "--clips_per_rir",
-        type=int,
-        default=20,
-        help="Number of different speech clips per RIR (default: 20)",
-    )
-    p.add_argument(
-        "--seq_len",
-        type=float,
-        default=4.0,
-        help="Audio segment length in seconds (default: 4.0)",
-    )
-    p.add_argument(
-        "--snr",
-        nargs=2,
-        type=float,
-        metavar=("MIN", "MAX"),
-        default=[20.0, 20.0],
-        help="SNR range in dB when noise is enabled (default: 20 20)",
-    )
-    p.add_argument(
-        "--noisy_proportion",
-        type=float,
-        default=1.0,
-        help="Fraction of samples that receive additive noise (default: 1.0)",
-    )
+    # Set dataset_root for the filtered/rotated BUT tree.  Set it to None and
+    # fill but_csv to use the legacy matched-CSV path instead.
+    dataset_root: Optional[Path] = Path("/storage/reie/Filteted and rotated BUT")
+    but_csv: Optional[Path] = None  # e.g. project_root / "config/but_matched.csv"
 
-    # ── output ─────────────────────────────────────────────────────────────
-    p.add_argument(
-        "--out_dir",
-        type=Path,
-        default=Path("results/but_eval"),
-        help="Output directory for artefacts (default: results/but_eval)",
-    )
+    speech_txt = project_root / "config/reie_validation_speech_quick.txt"
+    noise_txt: Optional[Path] = None  # e.g. project_root / "config/reie_train_noise.txt"
+    clips_per_rir = 20
+    seq_len = 4.0
+    snr_range: Tuple[float, float] = (20.0, 20.0)
+    noisy_proportion = 1.0
 
     # ── runtime ────────────────────────────────────────────────────────────
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device: cpu, cuda, or cuda:N (default: cuda if available)",
-    )
-    p.add_argument(
-        "--no_room_conditioning",
-        action="store_true",
-        help="Disable FiLM room conditioning even if the config enables it",
-    )
-    p.add_argument(
-        "--estimate_rt60",
-        action="store_true",
-        help=(
-            "Estimate RT60 from each RIR (Schroeder T20×3) and use it in "
-            "the FiLM room_params instead of the CSV metadata value. "
-            "Useful when metadata RT60 is known to differ from the real "
-            "room decay (e.g. BUT metadata vs wideband EDC)."
-        ),
-    )
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=4,
-        help="DataLoader batch size (default: 4)",
-    )
-    p.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="DataLoader num_workers (default: 4)",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for speech/noise selection (default: 42)",
-    )
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    no_room_conditioning = False
+    estimate_rt60 = False
+    # Match but_filtered_rotated: radius ≤ max_rad_value, then vol/dim in the
+    # training FiLM window (45 rooms × 20 clips).
+    filter_to_film_volume_range = True
+    batch_size = 4
+    num_workers = 0
+    seed = 42
 
-    return p
-
-
-def main(argv=None) -> None:
-    args = _build_parser().parse_args(argv)
-
-    # Validate paths
-    for attr, label in [
-        ("config", "--config"), ("checkpoint", "--checkpoint"),
-        ("but_csv", "--but_csv"), ("speech_txt", "--speech_txt"),
-    ]:
-        p = getattr(args, attr)
-        if not p.exists():
-            print(f"Error: {label} path does not exist: {p}", file=sys.stderr)
-            sys.exit(1)
-    if args.noise_txt is not None and not args.noise_txt.exists():
-        print(f"Error: --noise_txt path does not exist: {args.noise_txt}", file=sys.stderr)
+    # ── validate ───────────────────────────────────────────────────────────
+    for config_path, checkpoint_path, _out_dir in jobs:
+        for path, label in [
+            (config_path, "config_path"),
+            (checkpoint_path, "checkpoint_path"),
+        ]:
+            if not path.exists():
+                print(f"Error: {label} does not exist: {path}", file=sys.stderr)
+                sys.exit(1)
+    if not speech_txt.exists():
+        print(f"Error: speech_txt does not exist: {speech_txt}", file=sys.stderr)
         sys.exit(1)
 
-    run(
-        config_path          = args.config.expanduser().absolute(),
-        checkpoint_path      = args.checkpoint.expanduser().absolute(),
-        but_csv              = args.but_csv.expanduser().absolute(),
-        speech_txt           = args.speech_txt.expanduser().absolute(),
-        noise_txt            = args.noise_txt.expanduser().absolute() if args.noise_txt else None,
-        clips_per_rir        = args.clips_per_rir,
-        seq_len              = args.seq_len,
-        snr_range            = tuple(args.snr),
-        noisy_proportion     = args.noisy_proportion,
-        out_dir              = args.out_dir.expanduser().absolute(),
-        device_str           = args.device,
-        no_room_conditioning = args.no_room_conditioning,
-        estimate_rt60        = args.estimate_rt60,
-        batch_size           = args.batch_size,
-        num_workers          = args.num_workers,
-        seed                 = args.seed,
-    )
+    if dataset_root is not None:
+        if not dataset_root.is_dir():
+            print(f"Error: dataset_root is not a directory: {dataset_root}", file=sys.stderr)
+            sys.exit(1)
+        but_csv = None
+    else:
+        if but_csv is None or not but_csv.exists():
+            print(f"Error: but_csv does not exist: {but_csv}", file=sys.stderr)
+            sys.exit(1)
+
+    if noise_txt is not None and not noise_txt.exists():
+        print(f"Error: noise_txt does not exist: {noise_txt}", file=sys.stderr)
+        sys.exit(1)
+
+    for config_path, checkpoint_path, out_dir in jobs:
+        print(f"\n===== {out_dir.name} =====")
+        run(
+            config_path          = config_path.expanduser().absolute(),
+            checkpoint_path      = checkpoint_path.expanduser().absolute(),
+            but_csv              = but_csv.expanduser().absolute() if but_csv else None,
+            dataset_root         = dataset_root.expanduser().absolute() if dataset_root else None,
+            speech_txt           = speech_txt.expanduser().absolute(),
+            noise_txt            = noise_txt.expanduser().absolute() if noise_txt else None,
+            clips_per_rir        = clips_per_rir,
+            seq_len              = seq_len,
+            snr_range            = snr_range,
+            noisy_proportion     = noisy_proportion,
+            out_dir              = out_dir.expanduser().absolute(),
+            device_str           = device_str,
+            no_room_conditioning = no_room_conditioning,
+            estimate_rt60        = estimate_rt60,
+            batch_size           = batch_size,
+            num_workers          = num_workers,
+            seed                 = seed,
+            filter_to_film_volume_range = filter_to_film_volume_range,
+        )
 
 
 if __name__ == "__main__":
