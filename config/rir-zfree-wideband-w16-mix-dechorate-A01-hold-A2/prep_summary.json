@@ -1,0 +1,24 @@
+{
+  "n_total": 1023,
+  "n_train_rooms": 11,
+  "n_hold_rooms": 11,
+  "train_arrays": [
+    0,
+    1
+  ],
+  "hold_arrays": [
+    2
+  ],
+  "n_train_rirs": 748,
+  "n_hold_rirs": 275,
+  "hold_rooms": [],
+  "n_sim": 50000,
+  "n_real_oversampled": 50000,
+  "n_mixed": 100000,
+  "frac_real": 0.5,
+  "npz_dir": "/storage/reie/data/dechorate-arr012-npz",
+  "mixed_list": "/storage/reie/REC-RIR-LOCALIZATION/config/rir-zfree-wideband-w16-mix-dechorate-A01-hold-A2/reie-train-rir.txt",
+  "localization_csv": "/storage/reie/REC-RIR-LOCALIZATION/config/rir-zfree-wideband-w16-mix-dechorate-A01-hold-A2/rir_localization.csv",
+  "holdout_root": "/storage/reie/data/dechorate-arr012-holdout-A2",
+  "n_holdout_links": 275
+}
