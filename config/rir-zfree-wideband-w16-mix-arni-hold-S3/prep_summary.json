@@ -1,0 +1,19 @@
+{
+  "hold_speakers": [
+    "S3"
+  ],
+  "n_real_train": 50,
+  "n_real_hold": 25,
+  "n_twins": 5047,
+  "n_arni_pool": 5097,
+  "n_sim": 50000,
+  "n_arni_oversampled": 26923,
+  "n_mixed": 76923,
+  "frac_arni": 0.34999934999935,
+  "mixed_list": "/storage/reie/REC-RIR-LOCALIZATION/config/rir-zfree-wideband-w16-mix-arni-hold-S3/reie-train-rir.txt",
+  "localization_csv": "/storage/reie/REC-RIR-LOCALIZATION/config/rir-zfree-wideband-w16-mix-arni-hold-S3/rir_localization.csv",
+  "holdout_root": "/storage/reie/data/arni-mckenzie-holdout-S3",
+  "n_holdout_links": 25,
+  "npz_dir_real": "/tmp/arni-real-npz",
+  "twin_manifest": "/tmp/arni-twins-npz/manifest.json"
+}

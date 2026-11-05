@@ -1,0 +1,132 @@
+# Mixed widened-band gpuRIR + Arni near-wall real(S1/S2) + Arni gpuRIR twins.
+# Hold out real Arni source S3 for evaluation.
+# Start from A0/A1 dEchorate-mixed wideband checkpoint.
+#
+# Usage:
+#   cd /storage/reie/REC-RIR-LOCALIZATION
+#   /storage/reie/.venv_custom_ssh/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 train.py \
+#     -c config/Rec-RIR-heads-only-epoch35-straight-to-15m-zfree-wideband-w16-mix-arni-hold-S3-2gpu.toml \
+#     -p /storage/reie/experiments/epoch35-zfree-wideband-w16-mix-arni-hold-S3-2gpu \
+#     -s /storage/reie/experiments/epoch35-zfree-wideband-w16-mix-dechorate-A01-hold-A2-2gpu/ckpt/best.tar
+
+[meta]
+seed = 2033
+cudnn_enable = true
+use_torch_compile = false
+
+[wandb]
+project = "rec-rir-localization"
+entity = ""
+name = "arni-w16-mix-hold-S3"
+tags = ["training", "rec-rir", "zfree", "wideband-w16", "mix-arni", "hold-S3", "a6000", "2gpu"]
+notes = "Mixed ~65/35 widened-band gpuRIR + oversampled Arni real(S1/S2)+exact/dense twins. Hold out real S3. From A01-hold-A2 best.tar. 12 ep lr=1e-4."
+mode = "offline"
+
+[acoustic]
+path = "acoustics.feature.transforms"
+
+[dataloader]
+path = "dataset.dataset_RecRIR.MyDataloader"
+
+[optimizer]
+type = "AdamW"
+
+[scheduler]
+type = "CosineAnnealingLR"
+
+[trainer]
+path = "trainer_inferencer.trainer_RecRIR.Trainer"
+
+[model]
+path = "model.RecRIR.BiSpatialNet"
+
+[EM_algo]
+path = "method.pim.PIM"
+
+[acoustic.args]
+sr = 16000
+n_fft = 512
+win_len = 512
+hop_len = 256
+win_type = "sqrthann"
+
+[dataloader.args]
+src_pathlist = [ "config/reie_train_speech_quick.txt", "config/reie_validation_speech_quick.txt", "config/reie_validation_speech_quick.txt",]
+rir_pathlist = [ "config/rir-zfree-wideband-w16-mix-arni-hold-S3/reie-train-rir.txt", "config/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02-w16-zfree-s2032/reie-validation-rir.txt", "config/rir-uniform-angle-fullroom-edge-y0-band-min03-ow02-w16-zfree-s2032/reie-test-rir.txt",]
+noise_pathlist = [ "config/reie_train_noise.txt", "config/reie_train_noise.txt", "config/reie_train_noise.txt",]
+localization_csv = "/storage/reie/REC-RIR-LOCALIZATION/config/rir-zfree-wideband-w16-mix-arni-hold-S3/rir_localization.csv"
+localization_csv_columns = [ "rir_path", "angle_deg", "radius_m",]
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+snr_range = [ 5, 20,]
+seq_lenlist = [ 4.0, 6.0, 4.0,]
+batchsize = [ 4, 4, 1,]
+num_workers = 4
+seeds = [ 2033, 2034, 2035,]
+pin_memory = true
+prefetch_factor = 1
+persistent_workers = false
+rank = 0
+sr = 16000
+noisy_proportion = 1
+use_room_conditioning = true
+
+[optimizer.args]
+lr = 0.0001
+
+[scheduler.args]
+# ~12 epochs * ceil(76923 / (4*2)) ≈ 12 * 9616
+T_max = 115392
+eta_min = 1e-6
+
+[trainer.train]
+epochs = 12
+clip_grad_norm_value = 1
+save_ckpt_interval = 1
+loss_w_cln = 1.0
+loss_w_rvb = 1.0
+loss_w_rec = 1.0
+loss_w_angle = 1.0
+loss_w_radius = 1.0
+loss_type = "RIMag"
+angle_label_smoothing_sigma = 10.0
+radius_label_smoothing_sigma = 2.0
+retain_graph = true
+
+[trainer.validation]
+interval = 1
+save_max_metric = false
+best_metric = "localization"
+best_metric_radius_weight = 10.0
+
+[model.args]
+dim_input = 2
+dim_output_spch = 2
+dim_output_CTF = 120
+dim_hidden = 96
+dim_squeeze = 8
+num_freqs = 257
+num_layers_spch = 6
+num_layers_noise = 2
+num_layers_CTF = 6
+num_angles = 181
+max_rad_value = 13.0
+rad_resolution = 0.25
+encoder_kernel_size = 5
+dropout = [ 0, 0, 0,]
+kernel_size = [ 5, 3,]
+conv_groups = [ 8, 8,]
+norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
+full_share = 0
+attention = "mamba(16,4)"
+use_film = true
+num_room_params = 8
+embedding_type = "1dconv"
+embedding_1dconv_kernel = 5
+use_film_ctf_layers = true
+film_ctf_layer_indices = [ 0, 1, 2, 3, 4, 5,]
+film_identity_init = true
+
+[EM_algo.args]
+sr = 16000
