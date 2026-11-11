@@ -655,6 +655,10 @@ class MyDataloader(DataLoader):
             volume_shuffle_seed=self.volume_shuffle_seed,
         )
 
+        # DataLoader forbids prefetch_factor / persistent_workers when num_workers==0
+        # (common on pods with tiny /dev/shm where multiprocessing is unusable).
+        prefetch = self.prefetch_factor if self.num_workers > 0 else None
+        persistent = self.persistent_workers if self.num_workers > 0 else False
         return DataLoader(
             ds,
             sampler=(
@@ -666,9 +670,9 @@ class MyDataloader(DataLoader):
             ),  #
             batch_size=batchsize,  #
             num_workers=self.num_workers,
-            prefetch_factor=self.prefetch_factor,
+            prefetch_factor=prefetch,
             pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
+            persistent_workers=persistent,
             drop_last=True,
         )
 

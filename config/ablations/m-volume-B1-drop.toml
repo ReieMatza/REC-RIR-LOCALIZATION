@@ -29,7 +29,7 @@ entity = ""
 name = "m-volume-B1-drop"
 tags = ["training", "rec-rir", "epoch35", "straight-to-15m", "identity-film", "fullroom", "edge-mic", "y0-band", "zfree", "w09", "s2030", "option-a", "a6000", "2gpu"]
 notes = "Option A one-shot: epoch35.tar unfrozen on s2030 w09 edge [0.2,1.1] m with z-free heights. Replaces s2028+wideband chain. Identity ALL FiLM. Radius 13.0/0.25. 60 ep T_max=139971."
-mode = "online"
+mode = "offline"
 
 [acoustic]
 path = "acoustics.feature.transforms"
@@ -70,11 +70,11 @@ max_rad_value = 13.0
 rad_resolution = 0.25
 snr_range = [ 5, 20,]
 seq_lenlist = [ 4.0, 6.0, 4.0,]
-batchsize = [ 4, 4, 1,]
-num_workers = 4
+batchsize = [ 2, 2, 1,]  # A5000 24GB: 1/GPU after DDP split
+num_workers = 0
 seeds = [ 2022, 2023, 2024,]
 pin_memory = true
-prefetch_factor = 1
+prefetch_factor = 0
 persistent_workers = false
 rank = 0
 sr = 16000
