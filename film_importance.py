@@ -473,6 +473,31 @@ def run(
             "Permutation deltas will all be zero."
         )
 
+    # ---- Volume-only overlays (Phase 0 cheap controls; index 7) -------------
+    volume_overlay_rows: List[str] = []
+    if all_rp is not None and n_rp > 0 and all_rp.shape[1] >= 8:
+        print("\n[volume overlays] constant / zero on channel 7 only...")
+        for overlay_name, setter in (
+            ("volume_constant_0.5", lambda t: t.fill_(0.5)),
+            ("volume_zero", lambda t: t.fill_(0.0)),
+        ):
+            overlay_rp = all_rp.clone()
+            setter(overlay_rp[:, 7])
+            a_mat, r_mat, _ = _inference_pass(
+                model, valid_dataloader, transformfunc, device,
+                num_angles, num_radius,
+                num_samples=n_rp,
+                use_room_conditioning=True,
+                room_params_all=overlay_rp,
+                desc=f"Overlay {overlay_name}",
+            )
+            d_ang = _global_mae(a_mat, angle_unit_scale) - baseline_angle_mae
+            d_rad = _global_mae(r_mat, radius_unit_scale) - baseline_radius_mae
+            volume_overlay_rows.append(
+                f"    {overlay_name:22s}: angle Δ={d_ang:+.6f}°  radius Δ={d_rad:+.6f} m"
+            )
+            print(f"  {overlay_name}: angle Δ={d_ang:+.3f}°  radius Δ={d_rad:+.4f} m")
+
     # ---- Plots -------------------------------------------------------------
     print("\nPlotting...")
     ckpt_name = checkpoint_path.name
@@ -535,6 +560,14 @@ def run(
         f"  radius_head |d(logit)/d(param)|:\n"
         f"{_fmt_table(radius_grad_sens)}\n"
     )
+    if volume_overlay_rows:
+        summary += (
+            f"\n"
+            f"[volume_overlays]\n"
+            f"  eval-only replace of channel 7 (others intact):\n"
+            + "\n".join(volume_overlay_rows)
+            + "\n"
+        )
 
     summary_path = out_dir / "summary.txt"
     summary_path.write_text(summary)

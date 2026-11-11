@@ -57,6 +57,12 @@ _ROOM_SZ_MAX:  float = 15.0
 _LOG_VOL_MIN:  float = math.log(10.0)
 _LOG_VOL_MAX:  float = math.log(1000.0)
 _EPS:          float = 1e-8
+_NUM_ROOM_PARAMS: int = 8
+
+FILM_MODES = ("normal", "off", "zero", "shuffle")
+# Volume-channel-only policy (index 7). Independent of film_mode whole-vector ablations.
+# "true" keeps log-volume; others match dataloader volume_mode for train/eval parity.
+VOLUME_MODES = ("true", "drop", "constant", "shuffle", "random", "zero")
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +258,8 @@ def load_rotated_but_entries(root: Path) -> List[Dict[str, str]]:
             float(rot["mic_x"]),
             float(rot["mic_y"]),
         )
+        room_name = str(env.get("env_name", sample_dir.parent.parent.name))
+        mic_name = str(scenario.get("microphone", sample_dir.parent.name))
         entries.append({
             "rir_path": str(wav.resolve()),
             "angle_deg": f"{angle_deg:.4f}",
@@ -266,8 +274,9 @@ def load_rotated_but_entries(root: Path) -> List[Dict[str, str]]:
             "source_x": str(rot["source_x"]),
             "source_y": str(rot["source_y"]),
             "source_z": str(rot["source_z"]),
-            "room": str(env.get("env_name", sample_dir.parent.parent.name)),
-            "mic_id": str(scenario.get("microphone", sample_dir.parent.name)),
+            "room": room_name,
+            "mic_id": mic_name,
+            "group_key": f"{room_name}/{mic_name}",
             "spk_setup": str(scenario.get("speaker", sample_dir.name)),
             "applied_rotation": str(rotation.get("mode", "")),
         })
@@ -399,6 +408,163 @@ def class_to_radius(cls: int, rad_resolution: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Grouped metrics
+#
+# One BUT sample is a (room, microphone, source) triple scored with several
+# speech clips.  Every source recorded at one microphone shares the same room
+# geometry, so they all get the *same* FiLM vector: within a microphone
+# position the only thing that changes is the audio.  That makes the
+# microphone position the grouping that separates localization from room
+# identification:
+#
+#   between-group corr    can the model tell the microphone positions apart
+#   within-group corr     can it tell sources at one microphone apart -- this
+#                         is localization, everything else is a room prior
+#   group-constant MAE    score of an oracle that answers one number per
+#                         microphone position and never listens to the audio
+#   pred spread in group  how far the predictions move when only audio changes
+#
+# A plain MAE hides all of this: a model that memorises a per-room answer
+# scores well on it as long as the rooms differ from each other.
+# ---------------------------------------------------------------------------
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size < 3 or np.std(a) < 1e-9 or np.std(b) < 1e-9:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _best_constant(values: np.ndarray, grid: np.ndarray) -> Tuple[float, float]:
+    """Constant that minimises MAE over `values`, and that MAE."""
+    err = np.abs(values[None, :] - grid[:, None]).mean(axis=1)
+    i = int(np.argmin(err))
+    return float(grid[i]), float(err[i])
+
+
+def grouped_metrics(
+    group: np.ndarray,
+    rir: np.ndarray,
+    pred: np.ndarray,
+    gt: np.ndarray,
+    grid: np.ndarray,
+    seed: int = 0,
+    n_boot: int = 2000,
+) -> dict:
+    """Split the error into between-group and within-group parts.
+
+    `group` / `rir` / `pred` / `gt` are per clip.  Predictions are pooled to one
+    value per RIR (median over clips) before any correlation, so the clip count
+    never inflates the sample size.  The bootstrap resamples RIRs for the same
+    reason.
+    """
+    uniq_rir = sorted(set(rir))
+    rir_pred = np.array([float(np.median(pred[rir == k])) for k in uniq_rir])
+    rir_gt = np.array([float(gt[rir == k][0]) for k in uniq_rir])
+    rir_grp = np.array([group[rir == k][0] for k in uniq_rir])
+    rir_spread = np.array([float(np.std(pred[rir == k])) for k in uniq_rir])
+
+    uniq_grp = sorted(set(rir_grp))
+    grp_pred = np.array([rir_pred[rir_grp == g].mean() for g in uniq_grp])
+    grp_gt = np.array([rir_gt[rir_grp == g].mean() for g in uniq_grp])
+
+    # Oracle baselines that ignore the recording.
+    const, mae_const = _best_constant(gt, grid)
+    group_const_err = 0.0
+    for g in uniq_grp:
+        m = group == g
+        _, e = _best_constant(gt[m], grid)
+        group_const_err += e * m.sum()
+    mae_group_const = group_const_err / len(gt)
+
+    # Within-group: centre both sides on the group mean, keep groups that hold
+    # more than one source position.
+    multi = np.array([(rir_grp == g).sum() > 1 for g in rir_grp])
+    pc, gc = rir_pred.copy(), rir_gt.copy()
+    for g in uniq_grp:
+        m = rir_grp == g
+        if m.sum() > 1:
+            pc[m] -= rir_pred[m].mean()
+            gc[m] -= rir_gt[m].mean()
+
+    rng = np.random.default_rng(seed)
+    idx_by_rir = [np.where(rir == k)[0] for k in uniq_rir]
+    boots = np.empty(n_boot)
+    for i in range(n_boot):
+        pick = rng.integers(0, len(uniq_rir), len(uniq_rir))
+        idx = np.concatenate([idx_by_rir[j] for j in pick])
+        boots[i] = np.abs(pred[idx] - gt[idx]).mean()
+
+    per_group = []
+    for g in uniq_grp:
+        m = rir_grp == g
+        c = group == g
+        per_group.append({
+            "group": g,
+            "n_sources": int(m.sum()),
+            "gt_mean": float(rir_gt[m].mean()),
+            "gt_std": float(rir_gt[m].std()),
+            "pred_mean": float(rir_pred[m].mean()),
+            "pred_std_across_sources": float(rir_pred[m].std()),
+            "mae": float(np.abs(pred[c] - gt[c]).mean()),
+        })
+
+    return {
+        "n_clips": int(len(gt)),
+        "n_rirs": len(uniq_rir),
+        "n_groups": len(uniq_grp),
+        "n_groups_multi": int(sum(1 for g in uniq_grp if (rir_grp == g).sum() > 1)),
+        "mae_clip": float(np.abs(pred - gt).mean()),
+        "mae_rir_pooled": float(np.abs(rir_pred - rir_gt).mean()),
+        "mae_ci_lo": float(np.percentile(boots, 2.5)),
+        "mae_ci_hi": float(np.percentile(boots, 97.5)),
+        "baseline_constant": const,
+        "baseline_constant_mae": mae_const,
+        "baseline_group_constant_mae": mae_group_const,
+        "corr_all": _safe_corr(rir_pred, rir_gt),
+        "corr_between_groups": _safe_corr(grp_pred, grp_gt),
+        "corr_within_group": _safe_corr(pc[multi], gc[multi]),
+        "pred_std_within_group": float(
+            np.mean([rir_pred[rir_grp == g].std() for g in uniq_grp if (rir_grp == g).sum() > 1])
+        ),
+        "pred_std_across_clips": float(np.mean(rir_spread)),
+        "gt_std_within_group": float(
+            np.mean([rir_gt[rir_grp == g].std() for g in uniq_grp if (rir_grp == g).sum() > 1])
+        ),
+        "per_group": per_group,
+        "_rir_pred": rir_pred,
+        "_rir_gt": rir_gt,
+        "_rir_grp": rir_grp,
+        "_uniq_rir": uniq_rir,
+    }
+
+
+def format_grouped_metrics(m: dict, head: str, unit: str) -> List[str]:
+    beats_group = m["mae_clip"] < m["baseline_group_constant_mae"]
+    return [
+        f"[{head}: grouped by microphone position]",
+        f"  rirs / groups:               {m['n_rirs']} in {m['n_groups']} "
+        f"({m['n_groups_multi']} with >1 source)",
+        f"  MAE (per clip):              {m['mae_clip']:.3f}{unit}"
+        f"  95% CI over rirs [{m['mae_ci_lo']:.2f}, {m['mae_ci_hi']:.2f}]",
+        f"  MAE (pooled over clips):     {m['mae_rir_pooled']:.3f}{unit}",
+        f"  baseline, one constant:      {m['baseline_constant_mae']:.3f}{unit}"
+        f"  (at {m['baseline_constant']:.1f}{unit})",
+        f"  baseline, constant / group:  {m['baseline_group_constant_mae']:.3f}{unit}"
+        f"   <- oracle that never hears the audio"
+        f"{'' if beats_group else '   *** model does not beat it ***'}",
+        f"  corr, all rirs:              {m['corr_all']:.3f}",
+        f"  corr, between groups:        {m['corr_between_groups']:.3f}"
+        f"   (room identification)",
+        f"  corr, within group:          {m['corr_within_group']:.3f}"
+        f"   <- localization",
+        f"  pred spread within group:    {m['pred_std_within_group']:.3f}{unit}"
+        f"   (truth spreads {m['gt_std_within_group']:.3f}{unit})",
+        f"  pred spread across clips:    {m['pred_std_across_clips']:.3f}{unit}"
+        f"   (same rir, different speech)",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Audio helpers
 # ---------------------------------------------------------------------------
 
@@ -443,6 +609,16 @@ class ButRirDataset(Dataset):
         angle_deg    : float
         radius_m     : float
         clip_idx     : int  (which speech clip within this RIR)
+        group_key    : str  room/microphone the audio came from
+        film_group   : str  room/microphone the FiLM vector came from
+
+    `film_mode` controls the conditioning, so the same audio can be scored with
+    the wrong room vector:
+        normal   the entry's own geometry
+        zero     an all-zero vector
+        shuffle  the vector of a different microphone position (set up by the
+                 caller through the private "_film_row" key)
+    'off' is not a dataset mode: the caller passes room_params=None instead.
     """
 
     def __init__(
@@ -460,12 +636,20 @@ class ButRirDataset(Dataset):
         rad_resolution: float,
         seed: int = 42,
         estimate_rt60: bool = False,
+        film_mode: str = "normal",
+        volume_mode: str = "true",
+        volume_constant: float = 0.5,
+        volume_shuffle_seed: int = 2024,
+        randomize: bool = False,
     ) -> None:
         super().__init__()
         if not entries:
             raise ValueError("BUT CSV produced zero entries — nothing to evaluate.")
         if not speech_paths:
             raise ValueError("Speech path list is empty.")
+        vmode = str(volume_mode or "true").strip().lower()
+        if vmode not in VOLUME_MODES:
+            raise ValueError(f"volume_mode must be one of {VOLUME_MODES}, got {volume_mode!r}")
         self.entries = entries
         self.speech_paths = speech_paths
         self.noise_paths = noise_paths
@@ -480,6 +664,32 @@ class ButRirDataset(Dataset):
         self.seed = seed
         self.seq_samples = int(seq_len * sr)
         self.estimate_rt60 = estimate_rt60
+        self.film_mode = film_mode
+        self.volume_mode = vmode
+        self.volume_constant = float(volume_constant)
+        self.volume_shuffle_seed = int(volume_shuffle_seed)
+        self.randomize = randomize
+        self._volume_shuffle_donors: Dict[int, float] = {}
+        if self.volume_mode == "shuffle" and self.film_mode != "zero":
+            vols = []
+            for row in entries:
+                rp = compute_room_params_from_row(row)
+                vols.append(float(rp[7].item()))
+            if len(vols) >= 2:
+                rng_v = np.random.default_rng(self.volume_shuffle_seed)
+                perm = rng_v.permutation(len(vols))
+                self._volume_shuffle_donors = {
+                    i: float(vols[perm[i]]) for i in range(len(vols))
+                }
+        # NoiseX files are multi-minute WAVs; reloading them every sample dominates
+        # epoch time on slow shared FS. Cache once (15 files ≈ 200MB).
+        self._noise_cache: Dict[str, torch.Tensor] = {}
+        if noise_paths and noisy_proportion > 0:
+            for path in noise_paths:
+                try:
+                    self._noise_cache[path] = _load_mono_resampled(path, sr)
+                except Exception:
+                    continue
 
     def __len__(self) -> int:
         return len(self.entries) * self.clips_per_rir
@@ -489,7 +699,7 @@ class ButRirDataset(Dataset):
         clip_idx = idx %  self.clips_per_rir
         row = self.entries[rir_idx]
 
-        rng = np.random.default_rng(self.seed + idx)
+        rng = np.random.default_rng() if self.randomize else np.random.default_rng(self.seed + idx)
 
         # ── Load RIR ────────────────────────────────────────────────────────
         rir = _load_mono_resampled(row["rir_path"], self.sr)
@@ -503,7 +713,10 @@ class ButRirDataset(Dataset):
             rt60_est = estimate_rt60_from_rir(rir, self.sr)
 
         # ── Load speech ──────────────────────────────────────────────────────
-        speech_idx = (rir_idx * self.clips_per_rir + clip_idx) % len(self.speech_paths)
+        if self.randomize:
+            speech_idx = int(rng.integers(len(self.speech_paths)))
+        else:
+            speech_idx = (rir_idx * self.clips_per_rir + clip_idx) % len(self.speech_paths)
         speech = _load_mono_resampled(self.speech_paths[speech_idx], self.sr)
         speech = _cut_or_loop(speech, self.seq_samples, rng)
         if speech.abs().max() > 0:
@@ -520,7 +733,10 @@ class ButRirDataset(Dataset):
         if self.noise_paths and rng.random() < self.noisy_proportion:
             noise_path = self.noise_paths[int(rng.integers(len(self.noise_paths)))]
             try:
-                noise = _load_mono_resampled(noise_path, self.sr)
+                noise = self._noise_cache.get(noise_path)
+                if noise is None:
+                    noise = _load_mono_resampled(noise_path, self.sr)
+                    self._noise_cache[noise_path] = noise
                 noise = _cut_or_loop(noise, self.seq_samples, rng)
                 dp_power    = reverb.pow(2).mean()
                 noise_power = noise.pow(2).mean()
@@ -537,7 +753,38 @@ class ButRirDataset(Dataset):
             reverb = reverb / scale
 
         # ── Labels & conditioning ────────────────────────────────────────────
-        room_params  = compute_room_params_from_row(row, rt60_override=rt60_est)
+        if self.film_mode == "zero":
+            film_row = None
+            room_params = torch.zeros(_NUM_ROOM_PARAMS, dtype=torch.float32)
+        else:
+            film_row = row.get("_film_row") or row
+            room_params = compute_room_params_from_row(
+                film_row,
+                rt60_override=rt60_est if film_row is row else None,
+            )
+            # Volume-channel-only ablation (does not touch RT60 / size / mic).
+            vmode = self.volume_mode
+            if vmode == "drop":
+                room_params = room_params[:7].clone()
+            elif vmode == "zero":
+                room_params = room_params.clone()
+                room_params[7] = 0.0
+            elif vmode == "constant":
+                room_params = room_params.clone()
+                room_params[7] = self.volume_constant
+            elif vmode == "random":
+                room_params = room_params.clone()
+                room_params[7] = float(rng.uniform(0.0, 1.0))
+            elif vmode == "shuffle":
+                room_params = room_params.clone()
+                if rir_idx in self._volume_shuffle_donors:
+                    room_params[7] = self._volume_shuffle_donors[rir_idx]
+                else:
+                    room_params[7] = float(
+                        np.random.default_rng(
+                            self.volume_shuffle_seed + rir_idx
+                        ).uniform(0.0, 1.0)
+                    )
         angle_cls    = angle_to_class(float(row["angle_deg"]), self.num_angles)
         radius_cls   = radius_to_class(
             float(row["radius_m"]), self.max_rad_value, self.rad_resolution
@@ -552,6 +799,8 @@ class ButRirDataset(Dataset):
             float(row["angle_deg"]),
             float(row["radius_m"]),
             clip_idx,
+            row.get("group_key", "?"),
+            (film_row or {}).get("group_key", self.film_mode),
         )
 
 
@@ -753,8 +1002,14 @@ def run(
     num_workers: int,
     seed: int,
     filter_to_film_volume_range: bool = True,
-) -> None:
+    film_mode: str = "normal",
+    volume_mode: Optional[str] = None,
+    volume_constant: Optional[float] = None,
+    volume_shuffle_seed: Optional[int] = None,
+) -> dict:
     # ── Setup ────────────────────────────────────────────────────────────────
+    if film_mode not in FILM_MODES:
+        raise ValueError(f"film_mode must be one of {FILM_MODES}, got {film_mode!r}")
     if device_str == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU.")
         device_str = "cpu"
@@ -775,15 +1030,36 @@ def run(
     max_rad_value  = float(model_args.get("max_rad_value", dl_args.get("max_rad_value", 6.0)))
     rad_resolution = float(model_args.get("rad_resolution", dl_args.get("rad_resolution", 0.1)))
     num_radius = int(max_rad_value / rad_resolution) + 1
+    # Prefer explicit CLI/API args; else mirror train config dataloader.args.
+    resolved_volume_mode = str(
+        volume_mode if volume_mode is not None else dl_args.get("volume_mode", "true")
+    ).strip().lower()
+    if resolved_volume_mode not in VOLUME_MODES:
+        raise ValueError(
+            f"volume_mode must be one of {VOLUME_MODES}, got {resolved_volume_mode!r}"
+        )
+    resolved_volume_constant = float(
+        volume_constant
+        if volume_constant is not None
+        else dl_args.get("volume_constant", 0.5)
+    )
+    resolved_volume_shuffle_seed = int(
+        volume_shuffle_seed
+        if volume_shuffle_seed is not None
+        else dl_args.get("volume_shuffle_seed", seed)
+    )
 
     use_room_cond = (
         bool(dl_args.get("use_room_conditioning", False))
         and not no_room_conditioning
+        and film_mode != "off"
     )
     print(
         f"num_angle_classes={num_angles}, "
         f"num_radius_classes={num_radius} (max={max_rad_value}m, res={rad_resolution}m), "
         f"use_room_conditioning={use_room_cond}, "
+        f"film_mode={film_mode}, "
+        f"volume_mode={resolved_volume_mode}, "
         f"estimate_rt60={estimate_rt60}"
     )
 
@@ -805,6 +1081,8 @@ def run(
         data_src = f"but_csv={but_csv}"
 
     n_loaded = len(entries)
+    for row in entries:
+        row.setdefault("group_key", f"{row.get('room', '?')}/{row.get('mic_id', '?')}")
     # Tag radius-range + volume-range on the full table before dropping anything.
     _, _ = _split_by_model_radius_range(entries, max_rad_value)
     _, _ = _split_by_film_volume_range(entries)
@@ -863,6 +1141,24 @@ def run(
             f"(max_rad_value={max_rad_value:g} m, "
             f"volume=[{vol_min:g}, {vol_max:g}] m^3)."
         )
+    # ── FiLM ablation wiring ─────────────────────────────────────────────────
+    # "shuffle" hands each microphone position the room vector of the next one,
+    # so audio and conditioning disagree.  Predictions that follow the donor
+    # instead of the audio mean the output is read off the geometry, not heard.
+    if film_mode == "shuffle":
+        groups = sorted({row["group_key"] for row in entries})
+        if len(groups) < 2:
+            raise ValueError("film_mode='shuffle' needs at least 2 microphone positions")
+        donor_of = {g: groups[(i + 1) % len(groups)] for i, g in enumerate(groups)}
+        first_row_of = {}
+        for row in entries:
+            first_row_of.setdefault(row["group_key"], row)
+        for row in entries:
+            row["_film_row"] = first_row_of[donor_of[row["group_key"]]]
+        print("FiLM shuffle (audio group -> conditioning group):")
+        for g in groups:
+            print(f"  {g}  ->  {donor_of[g]}")
+
     print(
         f"BUT data: {data_src}  "
         f"({n_loaded} loaded, {n_after_radius} radius-in-range, "
@@ -900,6 +1196,10 @@ def run(
         rad_resolution=rad_resolution,
         seed=seed,
         estimate_rt60=estimate_rt60,
+        film_mode=film_mode,
+        volume_mode=resolved_volume_mode,
+        volume_constant=resolved_volume_constant,
+        volume_shuffle_seed=resolved_volume_shuffle_seed,
     )
     loader = DataLoader(
         dataset,
@@ -928,6 +1228,8 @@ def run(
             angle_degs,     # [B] float
             radius_ms,      # [B] float
             clip_idxs,      # [B] int
+            group_keys,     # tuple of str (B)
+            film_groups,    # tuple of str (B)
         ) = batch
 
         reverb_wav = reverb_wav.to(device)
@@ -960,6 +1262,8 @@ def run(
             gt_radius_m_f   = float(radius_ms[b])
             per_entry_rows.append({
                 "rir_path":        rir_paths[b],
+                "group_key":       group_keys[b],
+                "film_group":      film_groups[b],
                 "clip_idx":        int(clip_idxs[b]),
                 "gt_angle_deg":    gt_angle_deg_f,
                 "gt_angle_class":  int(ag_np[b]),
@@ -989,6 +1293,53 @@ def run(
         "radius", radius_matrix, out_dir, ckpt_name,
         axis_label="radius", unit_scale=rad_resolution, unit_suffix="m", head_name="Radius",
     )
+
+    # ── Grouped metrics ──────────────────────────────────────────────────────
+    grp   = np.array([r["group_key"] for r in per_entry_rows])
+    rir_k = np.array([r["rir_path"]  for r in per_entry_rows])
+    angle_grouped = grouped_metrics(
+        grp, rir_k,
+        np.array([r["pred_angle_deg"] for r in per_entry_rows], dtype=np.float64),
+        np.array([r["gt_angle_deg"]   for r in per_entry_rows], dtype=np.float64),
+        grid=np.arange(0.0, 180.5, 0.5), seed=seed,
+    )
+    radius_grouped = grouped_metrics(
+        grp, rir_k,
+        np.array([r["pred_radius_m"] for r in per_entry_rows], dtype=np.float64),
+        np.array([r["gt_radius_m"]   for r in per_entry_rows], dtype=np.float64),
+        grid=np.arange(0.0, max_rad_value + 1e-9, rad_resolution), seed=seed,
+    )
+
+    grouped_lines: List[str] = []
+    for head, unit, m in [("angle", "deg", angle_grouped), ("radius", "m", radius_grouped)]:
+        grouped_lines += format_grouped_metrics(m, head, unit) + [""]
+
+    # With shuffled conditioning, does the answer follow the donor geometry?
+    if film_mode == "shuffle":
+        donor_of = {r["group_key"]: r["film_group"] for r in per_entry_rows}
+        m = angle_grouped
+        gt_of_group = {
+            g: float(m["_rir_gt"][m["_rir_grp"] == g].mean()) for g in set(m["_rir_grp"])
+        }
+        groups = sorted(gt_of_group)
+        pred_g = np.array([m["_rir_pred"][m["_rir_grp"] == g].mean() for g in groups])
+        own_g  = np.array([gt_of_group[g] for g in groups])
+        don_g  = np.array([gt_of_group.get(donor_of.get(g, g), np.nan) for g in groups])
+        grouped_lines += [
+            "[angle: shuffled conditioning]",
+            f"  corr(pred, own group truth):    {_safe_corr(pred_g, own_g):.3f}",
+            f"  corr(pred, donor group truth):  {_safe_corr(pred_g, don_g):.3f}"
+            f"   <- higher means the answer follows the room vector",
+            "",
+        ]
+
+    for head, m in [("angle", angle_grouped), ("radius", radius_grouped)]:
+        csv_path = out_dir / f"{head}_per_group.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(m["per_group"][0].keys()))
+            w.writeheader()
+            w.writerows(m["per_group"])
+    print("\n" + "\n".join(grouped_lines))
 
     # per_entry_preds.csv
     pred_csv = out_dir / "per_entry_preds.csv"
@@ -1021,6 +1372,9 @@ def run(
         f"seq_len:         {seq_len} s",
         f"snr_range:       {snr_range} dB",
         f"use_room_cond:   {use_room_cond}",
+        f"film_mode:       {film_mode}",
+        f"volume_mode:     {resolved_volume_mode}",
+        f"volume_constant: {resolved_volume_constant}",
         f"estimate_rt60:   {estimate_rt60}",
         f"",
         f"[angle]",
@@ -1038,11 +1392,21 @@ def run(
         f"  samples_skipped:         {skipped_radius}",
         f"  top1_accuracy:           {radius_stats['acc']:.6f}",
         f"  mean_abs_error_m:        {radius_stats['mae']:.4f}",
-    ]
+        f"",
+    ] + grouped_lines
     summary_txt = "\n".join(summary_lines)
     (out_dir / "summary.txt").write_text(summary_txt + "\n")
     print(f"\nSaved all artefacts to: {out_dir}")
     print("\n" + summary_txt)
+
+    return {
+        "checkpoint": str(checkpoint_path),
+        "out_dir": str(out_dir),
+        "film_mode": film_mode,
+        "volume_mode": resolved_volume_mode,
+        "angle": angle_grouped,
+        "radius": radius_grouped,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1056,23 +1420,62 @@ def main() -> None:
     # Both jobs use the one-shot toml: the OpenSLR fine-tune toml sets
     # use_room_conditioning=false, but BUT eval must keep FiLM on.
     one_shot_toml = project_root / "config/Rec-RIR-heads-only-epoch35-straight-to-15m-2gpu.toml"
-    jobs = [
-        (
+    zfree_toml = project_root / "config/Rec-RIR-heads-only-epoch35-straight-to-15m-zfree-2gpu.toml"
+    mix_toml = project_root / "config/Rec-RIR-heads-only-epoch35-straight-to-15m-zfree-mix-openslr-2gpu.toml"
+    corrupt_toml = project_root / "config/Rec-RIR-heads-only-epoch35-straight-to-15m-zfree-mix-ir-corrupt-2gpu.toml"
+    models = {
+        "one-shot": (
             one_shot_toml,
             Path("/storage/reie/experiments/epoch35-straight-to-15m-2gpu/ckpt/best.tar"),
             project_root / "results/but_epoch35_straight_to_15m",
         ),
-        (
-            one_shot_toml,
-            Path("/root/experiments/epoch35-straight-to-15m-openslr-real-2gpu/ckpt/best.tar"),
-            Path("/root/experiments/epoch35-straight-to-15m-openslr-real-2gpu/but_45room"),
+        "z-free": (
+            zfree_toml,
+            Path("/storage/reie/experiments/epoch35-straight-to-15m-zfree-2gpu/ckpt/best.tar"),
+            project_root / "results/but_epoch35_straight_to_15m_zfree",
         ),
+        "mix-openslr": (
+            mix_toml,
+            Path("/storage/reie/experiments/epoch35-zfree-mix-openslr-2gpu/ckpt/best.tar"),
+            project_root / "results/but_epoch35_zfree_mix_openslr",
+        ),
+        "mix-ir-corrupt": (
+            corrupt_toml,
+            Path("/storage/reie/experiments/epoch35-mix-ir-corrupt-2gpu/ckpt/best.tar"),
+            project_root / "results/but_epoch35_mix_ir_corrupt",
+        ),
+    }
+
+    # The measured rooms, and their simulated twins from
+    # scripts/gen_but_twin_rirs.py: same geometry and labels, synthetic
+    # acoustics, walking toward the training distribution.
+    datasets = {
+        "measured":     Path("/storage/reie/Filteted and rotated BUT"),
+        "twin-exact":   Path("/storage/reie/data/but-twin/exact"),
+        "twin-rt60":    Path("/storage/reie/data/but-twin/rt60"),
+        "twin-heights": Path("/storage/reie/data/but-twin/heights"),
+    }
+
+    # FiLM modes:
+    #   normal   the entry's own geometry
+    #   off      no conditioning at all (room_params=None, FiLM is identity)
+    #   zero     an all-zero room vector
+    #   shuffle  another microphone position's room vector
+    # Together they say whether the output is read from the audio or from the
+    # geometry the model is handed.
+    #
+    # Each (model, dataset, film_mode) writes to the model's out_dir with the
+    # dataset and mode appended; measured + normal keeps the bare name.
+    # z-free / one-shot / mix-openslr already scored. IR-corrupt FT from mix
+    # needs the BUT 45-slice + twin-exact gates (normal + shuffle).
+    jobs = [
+        ("mix-ir-corrupt", "measured",   ["normal", "shuffle"]),
+        ("mix-ir-corrupt", "twin-exact", ["normal", "shuffle"]),
     ]
 
     # ── data ───────────────────────────────────────────────────────────────
-    # Set dataset_root for the filtered/rotated BUT tree.  Set it to None and
-    # fill but_csv to use the legacy matched-CSV path instead.
-    dataset_root: Optional[Path] = Path("/storage/reie/Filteted and rotated BUT")
+    # Rotated-BUT style trees come from `datasets` above.  Set but_csv and
+    # clear `datasets` to use the legacy matched-CSV path instead.
     but_csv: Optional[Path] = None  # e.g. project_root / "config/but_matched.csv"
 
     speech_txt = project_root / "config/reie_validation_speech_quick.txt"
@@ -1094,10 +1497,18 @@ def main() -> None:
     seed = 42
 
     # ── validate ───────────────────────────────────────────────────────────
-    for config_path, checkpoint_path, _out_dir in jobs:
+    for model_name, dataset_name, _modes in jobs:
+        if model_name not in models:
+            print(f"Error: unknown model {model_name!r}", file=sys.stderr)
+            sys.exit(1)
+        if dataset_name not in datasets:
+            print(f"Error: unknown dataset {dataset_name!r}", file=sys.stderr)
+            sys.exit(1)
+        config_path, checkpoint_path, _out = models[model_name]
         for path, label in [
             (config_path, "config_path"),
             (checkpoint_path, "checkpoint_path"),
+            (datasets[dataset_name], "dataset_root"),
         ]:
             if not path.exists():
                 print(f"Error: {label} does not exist: {path}", file=sys.stderr)
@@ -1106,42 +1517,107 @@ def main() -> None:
         print(f"Error: speech_txt does not exist: {speech_txt}", file=sys.stderr)
         sys.exit(1)
 
-    if dataset_root is not None:
-        if not dataset_root.is_dir():
-            print(f"Error: dataset_root is not a directory: {dataset_root}", file=sys.stderr)
-            sys.exit(1)
-        but_csv = None
-    else:
-        if but_csv is None or not but_csv.exists():
-            print(f"Error: but_csv does not exist: {but_csv}", file=sys.stderr)
-            sys.exit(1)
-
     if noise_txt is not None and not noise_txt.exists():
         print(f"Error: noise_txt does not exist: {noise_txt}", file=sys.stderr)
         sys.exit(1)
 
-    for config_path, checkpoint_path, out_dir in jobs:
-        print(f"\n===== {out_dir.name} =====")
-        run(
-            config_path          = config_path.expanduser().absolute(),
-            checkpoint_path      = checkpoint_path.expanduser().absolute(),
-            but_csv              = but_csv.expanduser().absolute() if but_csv else None,
-            dataset_root         = dataset_root.expanduser().absolute() if dataset_root else None,
-            speech_txt           = speech_txt.expanduser().absolute(),
-            noise_txt            = noise_txt.expanduser().absolute() if noise_txt else None,
-            clips_per_rir        = clips_per_rir,
-            seq_len              = seq_len,
-            snr_range            = snr_range,
-            noisy_proportion     = noisy_proportion,
-            out_dir              = out_dir.expanduser().absolute(),
-            device_str           = device_str,
-            no_room_conditioning = no_room_conditioning,
-            estimate_rt60        = estimate_rt60,
-            batch_size           = batch_size,
-            num_workers          = num_workers,
-            seed                 = seed,
-            filter_to_film_volume_range = filter_to_film_volume_range,
+    results = []
+    for model_name, dataset_name, film_modes in jobs:
+        config_path, checkpoint_path, out_dir = models[model_name]
+        dataset_root = datasets[dataset_name]
+        for film_mode in film_modes:
+            suffix = "_".join(
+                ([] if dataset_name == "measured" else [dataset_name.replace("-", "_")])
+                + ([] if film_mode == "normal" else [film_mode])
+            )
+            mode_dir = out_dir if not suffix else Path(f"{out_dir}_{suffix}")
+            print(
+                f"\n===== {model_name}  data={dataset_name}  film={film_mode}"
+                f"  -> {mode_dir.name} ====="
+            )
+            res = run(
+                config_path          = config_path.expanduser().absolute(),
+                checkpoint_path      = checkpoint_path.expanduser().absolute(),
+                but_csv              = but_csv.expanduser().absolute() if but_csv else None,
+                dataset_root         = dataset_root.expanduser().absolute(),
+                speech_txt           = speech_txt.expanduser().absolute(),
+                noise_txt            = noise_txt.expanduser().absolute() if noise_txt else None,
+                clips_per_rir        = clips_per_rir,
+                seq_len              = seq_len,
+                snr_range            = snr_range,
+                noisy_proportion     = noisy_proportion,
+                out_dir              = mode_dir.expanduser().absolute(),
+                device_str           = device_str,
+                no_room_conditioning = no_room_conditioning,
+                estimate_rt60        = estimate_rt60,
+                batch_size           = batch_size,
+                num_workers          = num_workers,
+                seed                 = seed,
+                filter_to_film_volume_range = filter_to_film_volume_range,
+                film_mode            = film_mode,
+            )
+            res["name"] = model_name
+            res["dataset"] = dataset_name
+            results.append(res)
+
+    table = comparison_table(results)
+    print(table)
+    out_table = project_root / "results/but_mix_ir_corrupt_comparison.txt"
+    out_table.write_text(table + "\n")
+    print(f"wrote {out_table}")
+
+
+def comparison_table(results: List[dict]) -> str:
+    """One row per (checkpoint, dataset, film_mode), plus the audio-free oracles."""
+    hdr = (
+        f"{'model':15s} {'data':13s} {'film':8s} {'ang MAE':>9s} {'95% CI':>14s} "
+        f"{'r within':>9s} {'r between':>10s} {'pred sd':>8s} "
+        f"{'rad MAE':>8s} {'r within':>9s}"
+    )
+    lines = ["", "=" * len(hdr), hdr, "-" * len(hdr)]
+    for r in results:
+        a, d = r["angle"], r["radius"]
+        lines.append(
+            f"{r['name']:15s} {r.get('dataset', 'measured'):13s} {r['film_mode']:8s} "
+            f"{a['mae_clip']:8.2f}d "
+            f"{'[%5.1f,%5.1f]' % (a['mae_ci_lo'], a['mae_ci_hi']):>14s} "
+            f"{a['corr_within_group']:9.2f} {a['corr_between_groups']:10.2f} "
+            f"{a['pred_std_within_group']:7.1f}d "
+            f"{d['mae_clip']:7.2f}m {d['corr_within_group']:9.2f}"
         )
+    # With shuffled conditioning, how close is the answer to what the donor
+    # microphone position gets with its own audio?  Small numbers mean the
+    # recording is not being used.
+    normal_of = {
+        (r["name"], r.get("dataset", "measured")):
+            {g["group"]: g["pred_mean"] for g in r["angle"]["per_group"]}
+        for r in results if r["film_mode"] == "normal"
+    }
+    for r in results:
+        key = (r["name"], r.get("dataset", "measured"))
+        if r["film_mode"] != "shuffle" or key not in normal_of:
+            continue
+        ref = normal_of[key]
+        groups = sorted(ref)
+        donor = {g: groups[(i + 1) % len(groups)] for i, g in enumerate(groups)}
+        shuf = np.array([g["pred_mean"] for g in r["angle"]["per_group"]])
+        keys = [g["group"] for g in r["angle"]["per_group"]]
+        lines.append(
+            f"{r['name']:15s} {key[1]:13s} {'shuffle vs donor':17s} "
+            f"{np.abs(shuf - np.array([ref[donor[k]] for k in keys])).mean():7.1f}d"
+            f"   from the donor's own answer,"
+            f" {np.abs(shuf - np.array([ref[k] for k in keys])).mean():.1f}d from its own"
+        )
+
+    a0 = results[0]["angle"]
+    lines += [
+        "-" * len(hdr),
+        f"{'oracle':15s} {'per-group constant':31s} {a0['baseline_group_constant_mae']:7.2f}d"
+        f"   (angle, never hears the audio)",
+        f"{'oracle':15s} {'one constant':31s} {a0['baseline_constant_mae']:7.2f}d",
+        "=" * len(hdr),
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
