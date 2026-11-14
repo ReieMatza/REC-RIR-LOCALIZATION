@@ -569,13 +569,27 @@ def format_grouped_metrics(m: dict, head: str, unit: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def _load_mono_resampled(path: str, target_sr: int) -> torch.Tensor:
-    """Load any WAV → mono float32 at target_sr. Returns 1-D tensor."""
-    wav, sr = torchaudio.load(path)          # [C, T]
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)  # mix to mono
+    """Load WAV or labeled gpuRIR ``.npz`` → mono float32 at target_sr.
+
+    Returns a 1-D tensor. NPZ files use the ``rir`` / ``fs`` fields written by
+    the synthetic / mix packers (shape ``[n_src, n_mic, T]`` or ``[n_mic, T]``).
+    """
+    if str(path).lower().endswith(".npz"):
+        with np.load(path, allow_pickle=False) as z:
+            rir = np.asarray(z["rir"], dtype=np.float32)
+            sr = int(np.asarray(z["fs"]).reshape(-1)[0])
+        # Collapse source/mic dims → mono [T]
+        while rir.ndim > 1:
+            rir = rir.mean(axis=0)
+        wav = torch.from_numpy(np.ascontiguousarray(rir)).unsqueeze(0)  # [1, T]
+    else:
+        wav, sr = torchaudio.load(path)  # [C, T]
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        sr = int(sr)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
-    return wav.squeeze(0)                    # [T]
+    return wav.squeeze(0)  # [T]
 
 
 def _cut_or_loop(wav: torch.Tensor, target_len: int, rng: np.random.Generator) -> torch.Tensor:
