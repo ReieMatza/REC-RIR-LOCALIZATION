@@ -11,12 +11,15 @@
 # Data: rir-uniform-angle-fullroom-edge-y0-band-min03-ow02-w09-zfree-s2030
 # -s REC-RIR-LOCALIZATION/ckpt/epoch35.tar
 #
-# Usage (2x RTX 6000 Ada):
+# Usage (2x H100 80GB on reie-ssh4-0-12):
 #   cd /storage/reie/REC-RIR-LOCALIZATION
 #   /storage/reie/.venv_custom_ssh/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 train.py \
-#     -c config/Rec-RIR-heads-only-epoch35-straight-to-15m-zfree-w09-2gpu.toml \
-#     -p /storage/reie/experiments/epoch35-straight-to-15m-zfree-w09-2gpu \
+#     -c config/ablations/m-volume-B1-drop.toml \
+#     -p /storage/reie/experiments/m-vol-B1-drop \
 #     -s /storage/reie/REC-RIR-LOCALIZATION/ckpt/epoch35.tar
+#
+# Warm-start: epoch35.tar is 8-D FiLM; model is 7-D. base_trainer_RecRIR
+# _filter_shape_mismatches drops mismatched FiLM tensors (reinit) — no silent wrong-load.
 
 [meta]
 seed = 2024
@@ -27,8 +30,8 @@ use_torch_compile = false
 project = "rec-rir-localization"
 entity = ""
 name = "m-volume-B1-drop"
-tags = ["training", "rec-rir", "epoch35", "straight-to-15m", "identity-film", "fullroom", "edge-mic", "y0-band", "zfree", "w09", "s2030", "option-a", "a6000", "2gpu"]
-notes = "Option A one-shot: epoch35.tar unfrozen on s2030 w09 edge [0.2,1.1] m with z-free heights. Replaces s2028+wideband chain. Identity ALL FiLM. Radius 13.0/0.25. 60 ep T_max=139971."
+tags = ["training", "rec-rir", "epoch35", "straight-to-15m", "identity-film", "fullroom", "edge-mic", "y0-band", "zfree", "w09", "s2030", "option-a", "h100", "2gpu", "m-volume-B1-drop"]
+notes = "B1 drop volume (7-D m). Same w09/s2030 recipe as B0. Warm-start epoch35.tar with FiLM shape-mismatch reinit. H100 batch [8,8,1] (4/GPU after DDP). 60 ep T_max=103740."
 mode = "offline"
 
 [acoustic]
@@ -70,7 +73,9 @@ max_rad_value = 13.0
 rad_resolution = 0.25
 snr_range = [ 5, 20,]
 seq_lenlist = [ 4.0, 6.0, 4.0,]
-batchsize = [ 2, 2, 1,]  # A5000 24GB: 1/GPU after DDP split
+# train.py divides train/val batch by nproc_per_node before DataLoader.
+# [8,8,1] → 4/GPU on 2×H100 (Ada B5 used [4,4,1] → 2/GPU). /dev/shm=64MB → workers=0.
+batchsize = [ 8, 8, 1,]
 num_workers = 0
 seeds = [ 2022, 2023, 2024,]
 pin_memory = true
@@ -86,7 +91,8 @@ volume_mode = "drop"
 lr = 0.0005
 
 [scheduler.args]
-T_max = 139_971
+# ~1729 steps/ep × 60 ep at batch 4/GPU (speech_quick ≈13830 / (2×4))
+T_max = 103_740
 eta_min = 1e-6
 
 [trainer.train]
