@@ -912,7 +912,11 @@ def main() -> None:
     p.add_argument(
         "--resume",
         action="store_true",
-        help="Skip folds that already have summary.json + pred CSVs; still re-score zero-shot.",
+        help=(
+            "Skip folds that already have summary.json + pred CSVs; still re-score "
+            "zero-shot. If last.pt + pred CSVs exist without summary.json, skip FT "
+            "and finish quadrant scoring from the saved weights."
+        ),
     )
     p.add_argument("--wandb-mode", default="online")
     p.add_argument(
@@ -1198,6 +1202,7 @@ def main() -> None:
 
         pred_n_path = fold_dir / "preds_normal.csv"
         pred_s_path = fold_dir / "preds_shuffle.csv"
+        last_pt_path = fold_dir / "last.pt"
         if (
             args.resume
             and (fold_dir / "summary.json").exists()
@@ -1222,6 +1227,96 @@ def main() -> None:
                 f"  resume skip train  "
                 f"{_fmt(saved['ft_normal'])}",
                 flush=True,
+            )
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
+
+        # Interrupted after FT (last.pt + preds) but before summary/quadrants.
+        if (
+            args.resume
+            and last_pt_path.exists()
+            and pred_n_path.exists()
+            and pred_s_path.exists()
+            and not (fold_dir / "summary.json").exists()
+        ):
+            blob = torch.load(last_pt_path, map_location=device, weights_only=False)
+            model.load_state_dict(blob["model"])
+            last_n = _scored_from_rows(
+                _read_pred_csv(pred_n_path), "normal", max_rad_value, rad_resolution
+            )
+            last_s = _scored_from_rows(
+                _read_pred_csv(pred_s_path), "shuffle", max_rad_value, rad_resolution
+            )
+            pooled_ft_n.extend(_tag_job_rows(last_n["rows"], job))
+            pooled_ft_s.extend(_tag_job_rows(last_s["rows"], job))
+            print(
+                f"  resume wrap from last.pt  "
+                f"{_fmt(_metrics_row(f'fold{fi}-ft-normal', last_n))}",
+                flush=True,
+            )
+            quadrant_metrics: dict[str, dict] = {}
+            eval_sets = job.get("eval_sets") or {}
+            for qname, q_entries in eval_sets.items():
+                if not q_entries:
+                    continue
+                if qname in ("hold_mic_hold_src", "hold_rt60"):
+                    quadrant_metrics[qname] = {
+                        "normal": _metrics_row(f"fold{fi}-{qname}-normal", last_n),
+                        "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", last_s),
+                        "n_rirs": len(q_entries),
+                    }
+                    continue
+                q_n = _score(model, q_entries, film_mode="normal", **score_kw)
+                q_s = _score(
+                    model,
+                    _attach_donors(q_entries, donor_entries),
+                    film_mode="shuffle",
+                    **score_kw,
+                )
+                quadrant_metrics[qname] = {
+                    "normal": _metrics_row(f"fold{fi}-{qname}-normal", q_n),
+                    "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", q_s),
+                    "n_rirs": len(q_entries),
+                }
+                print(
+                    f"  quadrant {qname:22s}  "
+                    f"{quadrant_metrics[qname]['normal']['ang_mae']:6.2f}°  "
+                    f"shuffle {quadrant_metrics[qname]['shuffle']['ang_mae']:6.2f}°  "
+                    f"n={len(q_entries)}",
+                    flush=True,
+                )
+            fold_summaries.append(
+                {
+                    "fold": fi,
+                    "hold": hold,
+                    "split": args.split,
+                    "k": args.k if args.split == "kshot" else None,
+                    "draw": job["draw"],
+                    "train_frac": job.get("train_frac"),
+                    "src_train_frac": job.get("src_train_frac"),
+                    "train_mics": job.get("train_mics"),
+                    "test_mics": job.get("test_mics"),
+                    "train_srcs": job.get("train_srcs"),
+                    "test_srcs": job.get("test_srcs"),
+                    "n_train_rirs": n_real_train,
+                    "n_train_rirs_with_synth": len(train_entries),
+                    "n_synth_train": n_synth_train,
+                    "mix_ratio": float(args.mix_ratio) if synth_pool is not None else 0.0,
+                    "n_test_rirs": len(test_entries),
+                    "n_test_mics": len({r["group_key"] for r in test_entries}),
+                    "zero_normal": z_n_row,
+                    "zero_shuffle": z_s_row,
+                    "ft_normal": _metrics_row(f"fold{fi}-ft-normal", last_n),
+                    "ft_shuffle": _metrics_row(f"fold{fi}-ft-shuffle", last_s),
+                    "quadrants": quadrant_metrics,
+                    "history": [],
+                    "resumed_wrap_from_last_pt": True,
+                }
+            )
+            (fold_dir / "summary.json").write_text(
+                json.dumps(fold_summaries[-1], indent=2, default=str)
             )
             del model
             if device.type == "cuda":
