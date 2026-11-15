@@ -637,7 +637,7 @@ class ButRirDataset(Dataset):
         seed: int = 42,
         estimate_rt60: bool = False,
         film_mode: str = "normal",
-        volume_mode: str = "true",
+        volume_mode: str = "drop",
         volume_constant: float = 0.5,
         volume_shuffle_seed: int = 2024,
         randomize: bool = False,
@@ -647,7 +647,7 @@ class ButRirDataset(Dataset):
             raise ValueError("BUT CSV produced zero entries — nothing to evaluate.")
         if not speech_paths:
             raise ValueError("Speech path list is empty.")
-        vmode = str(volume_mode or "true").strip().lower()
+        vmode = str(volume_mode or "drop").strip().lower()
         if vmode not in VOLUME_MODES:
             raise ValueError(f"volume_mode must be one of {VOLUME_MODES}, got {volume_mode!r}")
         self.entries = entries
@@ -755,14 +755,15 @@ class ButRirDataset(Dataset):
         # ── Labels & conditioning ────────────────────────────────────────────
         if self.film_mode == "zero":
             film_row = None
-            room_params = torch.zeros(_NUM_ROOM_PARAMS, dtype=torch.float32)
+            n_room = 7 if self.volume_mode == "drop" else _NUM_ROOM_PARAMS
+            room_params = torch.zeros(n_room, dtype=torch.float32)
         else:
             film_row = row.get("_film_row") or row
             room_params = compute_room_params_from_row(
                 film_row,
                 rt60_override=rt60_est if film_row is row else None,
             )
-            # Volume-channel-only ablation (does not touch RT60 / size / mic).
+            # Volume-channel-only policy (does not touch RT60 / size / mic).
             vmode = self.volume_mode
             if vmode == "drop":
                 room_params = room_params[:7].clone()
@@ -794,7 +795,7 @@ class ButRirDataset(Dataset):
             reverb.unsqueeze(0),                          # [1, T]
             torch.tensor(angle_cls,  dtype=torch.long),
             torch.tensor(radius_cls, dtype=torch.long),
-            room_params,                                  # [8]
+            room_params,                                  # [7] drop / [8] otherwise
             row["rir_path"],
             float(row["angle_deg"]),
             float(row["radius_m"]),
@@ -1032,7 +1033,7 @@ def run(
     num_radius = int(max_rad_value / rad_resolution) + 1
     # Prefer explicit CLI/API args; else mirror train config dataloader.args.
     resolved_volume_mode = str(
-        volume_mode if volume_mode is not None else dl_args.get("volume_mode", "true")
+        volume_mode if volume_mode is not None else dl_args.get("volume_mode", "drop")
     ).strip().lower()
     if resolved_volume_mode not in VOLUME_MODES:
         raise ValueError(

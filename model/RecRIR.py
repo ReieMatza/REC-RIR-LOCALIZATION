@@ -472,7 +472,7 @@ class BiSpatialNet(nn.Module):
         full_share: int = 0,  # share from layer 0
         attention: str = "mhsa(251)",  # mhsa(frames), ret(factor)
         use_film: bool = False,
-        num_room_params: int = 8,
+        num_room_params: int = 7,  # production default: drop log-volume from m
         embedding_type: str = "mean",  # "mean" | "variance" | "1dconv"
         embedding_1dconv_kernel: int = 5,
         # FiLM injected into the CTF backbone (one per indicated CTF layer,

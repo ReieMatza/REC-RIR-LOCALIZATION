@@ -39,7 +39,7 @@ class MyDataset(BaseDataset):
         rad_resolution: float = 0.1,
         use_room_conditioning: bool = False,
         rir_corrupt=None,
-        volume_mode: str = "true",
+        volume_mode: str = "drop",
         volume_constant: float = 0.5,
         volume_shuffle_seed: int = 2024,
         *args,
@@ -74,9 +74,9 @@ class MyDataset(BaseDataset):
         self.rad_resolution = rad_resolution
         self.use_room_conditioning = use_room_conditioning
         self.rir_corrupt = rir_corrupt
-        # Volume-channel ablation: true | drop | constant | shuffle | random | zero
-        # (only channel 7 / log-volume; other m dims stay intact).
-        mode = str(volume_mode or "true").strip().lower()
+        # Volume-channel policy: true | drop | constant | shuffle | random | zero
+        # Production default is drop (7-D m: RT60 + room_sz + mic_center).
+        mode = str(volume_mode or "drop").strip().lower()
         allowed_volume_modes = {"true", "drop", "constant", "shuffle", "random", "zero"}
         if mode not in allowed_volume_modes:
             raise ValueError(
@@ -154,6 +154,7 @@ class MyDataset(BaseDataset):
         rad_idx = int(round(radius_m / self.rad_resolution))
         return max(0, min(num_rad - 1, rad_idx))
 
+    # Full vector before volume_mode; drop yields 7-D (no log-volume).
     NUM_ROOM_PARAMS = 8  # RT60(1) + room_sz(3) + mic_center(3) + volume(1)
 
     def _normalize_log_volume(self, volume_m3: float) -> float:
@@ -533,7 +534,7 @@ class MyDataloader(DataLoader):
         rank: int = 0,
         noisy_proportion: float = 0.75,
         use_room_conditioning: bool = False,
-        volume_mode: str = "true",
+        volume_mode: str = "drop",
         volume_constant: float = 0.5,
         volume_shuffle_seed: int = 2024,
         rir_corrupt_enabled: bool = False,
@@ -585,7 +586,7 @@ class MyDataloader(DataLoader):
         self.rad_resolution = rad_resolution
         self.num_workers = num_workers
         self.use_room_conditioning = use_room_conditioning
-        self.volume_mode = str(volume_mode or "true").strip().lower()
+        self.volume_mode = str(volume_mode or "drop").strip().lower()
         self.volume_constant = float(volume_constant)
         self.volume_shuffle_seed = int(volume_shuffle_seed)
         if rir_corrupt_enabled:
