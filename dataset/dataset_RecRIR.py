@@ -38,6 +38,10 @@ class MyDataset(BaseDataset):
         max_rad_value: float = 6.0,
         rad_resolution: float = 0.1,
         use_room_conditioning: bool = False,
+        rir_corrupt=None,
+        volume_mode: str = "drop",
+        volume_constant: float = 0.5,
+        volume_shuffle_seed: int = 2024,
         *args,
         **kwargs
     ) -> BaseDataset:
@@ -69,6 +73,18 @@ class MyDataset(BaseDataset):
         self.max_rad_value = max_rad_value
         self.rad_resolution = rad_resolution
         self.use_room_conditioning = use_room_conditioning
+        self.rir_corrupt = rir_corrupt
+        # Volume-channel policy: true | drop | constant | shuffle | random | zero
+        # Production default is drop (7-D m: RT60 + room_sz + mic_center).
+        mode = str(volume_mode or "drop").strip().lower()
+        allowed_volume_modes = {"true", "drop", "constant", "shuffle", "random", "zero"}
+        if mode not in allowed_volume_modes:
+            raise ValueError(
+                f"volume_mode must be one of {sorted(allowed_volume_modes)}, got {volume_mode!r}"
+            )
+        self.volume_mode = mode
+        self.volume_constant = float(volume_constant)
+        self.volume_shuffle_seed = int(volume_shuffle_seed)
         # Fixed normalization ranges for room params (RT60 [0.1,1.5], room_sz max 15m, mic_center by room_sz)
         self._rt60_min, self._rt60_max = 0.1, 1.5
         self._room_sz_max = 15.0
@@ -95,6 +111,10 @@ class MyDataset(BaseDataset):
         # self.rir_type = rir_type
         self.shuffle = shuffle
         self.length = len(self.source_pathlist)
+        # For shuffle mode: fixed path → donor volume (breaks size/volume coupling).
+        self._shuffled_volume_by_path: Dict[str, float] = {}
+        if self.use_room_conditioning and self.volume_mode == "shuffle":
+            self._shuffled_volume_by_path = self._build_shuffled_volume_map()
 
     def _read_pathlist(self, pathlist_txt: str) -> List[str]:
         with open(os.path.abspath(pathlist_txt), "r") as handle:
@@ -121,6 +141,9 @@ class MyDataset(BaseDataset):
         angle_deg = angle_deg % 360.0
         if self.num_angles <= 180:
             angle_deg = min(angle_deg, 360.0 - angle_deg)
+        if self.num_angles >= 360:
+            angle_idx = int(angle_deg) % self.num_angles
+            return angle_idx
         angle_idx = int(angle_deg)
         return max(0, min(self.num_angles - 1, angle_idx))
 
@@ -131,7 +154,93 @@ class MyDataset(BaseDataset):
         rad_idx = int(round(radius_m / self.rad_resolution))
         return max(0, min(num_rad - 1, rad_idx))
 
+    # Full vector before volume_mode; drop yields 7-D (no log-volume).
     NUM_ROOM_PARAMS = 8  # RT60(1) + room_sz(3) + mic_center(3) + volume(1)
+
+    def _normalize_log_volume(self, volume_m3: float) -> float:
+        eps = 1e-8
+        log_vol = np.log(max(float(volume_m3), eps))
+        return float(
+            np.clip(
+                (log_vol - self._log_vol_min) / (self._log_vol_max - self._log_vol_min),
+                0.0,
+                1.0,
+            )
+        )
+
+    def _volume_norm_from_npz(self, path: str) -> Optional[float]:
+        """Read only room_sz from an RIR npz and return log-normalized volume."""
+        try:
+            with np.load(path) as rir_dict:
+                room_sz = np.asarray(rir_dict["room_sz"]).ravel()
+            if room_sz.size < 3:
+                return None
+            volume_m3 = float(room_sz[0] * room_sz[1] * room_sz[2])
+            return self._normalize_log_volume(volume_m3)
+        except (OSError, KeyError, ValueError, IndexError):
+            return None
+
+    def _build_shuffled_volume_map(self) -> Dict[str, float]:
+        """Fixed path→volume permutation for volume_mode=shuffle (seeded)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        npz_paths = [
+            p for p in self.rir_pathlist if os.path.splitext(p)[1] == ".npz"
+        ]
+        if len(npz_paths) < 2:
+            return {}
+
+        def _one(path: str) -> Tuple[str, Optional[float]]:
+            return os.path.normpath(path), self._volume_norm_from_npz(path)
+
+        valid_paths: List[str] = []
+        vols: List[float] = []
+        # Threaded IO: room_sz-only npz reads are cheap CPU, FS-bound.
+        with ThreadPoolExecutor(max_workers=min(32, max(4, os.cpu_count() or 8))) as pool:
+            for path, v in pool.map(_one, npz_paths, chunksize=64):
+                if v is None:
+                    continue
+                valid_paths.append(path)
+                vols.append(float(v))
+        if len(vols) < 2:
+            return {}
+        rng = np.random.default_rng(self.volume_shuffle_seed)
+        perm = rng.permutation(len(vols))
+        return {p: float(vols[perm[i]]) for i, p in enumerate(valid_paths)}
+
+    def _apply_volume_mode(
+        self,
+        room_params: torch.Tensor,
+        rir_path: str,
+        rng: np.random.Generator,
+    ) -> torch.Tensor:
+        """Apply volume_mode to channel 7 (or drop it). Other dims unchanged."""
+        mode = self.volume_mode
+        if mode == "true":
+            return room_params
+        if mode == "drop":
+            return room_params[:7].clone()
+        out = room_params.clone()
+        if out.numel() < 8:
+            return out
+        if mode == "zero":
+            out[7] = 0.0
+        elif mode == "constant":
+            out[7] = self.volume_constant
+        elif mode == "random":
+            out[7] = float(rng.uniform(0.0, 1.0))
+        elif mode == "shuffle":
+            key = os.path.normpath(rir_path)
+            if key in self._shuffled_volume_by_path:
+                out[7] = self._shuffled_volume_by_path[key]
+            else:
+                # Fallback: break coupling with a seeded draw (rare missing path).
+                out[7] = float(
+                    np.random.default_rng(
+                        self.volume_shuffle_seed + (hash(key) % 1_000_003)
+                    ).uniform(0.0, 1.0)
+                )
+        return out
 
     def _extract_room_params(self, rir_dict: np.lib.npyio.NpzFile) -> Optional[torch.Tensor]:
         """Extract and normalize room params from npz: RT60 + room_sz + mic_center + volume = 8 scalars."""
@@ -169,12 +278,7 @@ class MyDataset(BaseDataset):
             # (closet-sized to small auditorium). Anything outside clips to the
             # endpoints. On a 2000-sample diagnostic from this dataset the new
             # mapping gives range [0.28, 1.0] with mean 0.72 and 0 clipped.
-            log_vol = np.log(max(volume_m3, eps))
-            volume_norm = np.clip(
-                (log_vol - self._log_vol_min) / (self._log_vol_max - self._log_vol_min),
-                0.0,
-                1.0,
-            )
+            volume_norm = self._normalize_log_volume(volume_m3)
             room_params = np.concatenate(
                 [[rt60_norm], room_sz_norm, mic_center_norm, [volume_norm]]
             ).astype(np.float32)
@@ -319,7 +423,8 @@ class MyDataset(BaseDataset):
 
         rir_key = os.path.normpath(rir_this)
 
-        room_params = torch.zeros(self.NUM_ROOM_PARAMS, dtype=torch.float32)
+        n_room = 7 if self.volume_mode == "drop" else self.NUM_ROOM_PARAMS
+        room_params = torch.zeros(n_room, dtype=torch.float32)
         _, ext = os.path.splitext(rir_this)
         if ext == ".npz":
             rir_dict = np.load(rir_this)
@@ -329,10 +434,15 @@ class MyDataset(BaseDataset):
             if self.use_room_conditioning:
                 extracted = self._extract_room_params(rir_dict)
                 if extracted is not None:
-                    room_params = extracted
+                    room_params = self._apply_volume_mode(extracted, rir_this, rng)
             scale_rir = rir.abs().max()
             rir /= scale_rir
             dprir /= scale_rir
+            if self.rir_corrupt is not None and getattr(self.rir_corrupt, "enabled", False):
+                from .rir_corrupt import corrupt_rir, peak_cut_dp
+
+                rir = corrupt_rir(rir, rng, self.rir_corrupt)
+                dprir = peak_cut_dp(rir, self.sr)
             reverb, target, targetSNR = self.gen_real_datapair(source, rir, dprir)
 
         else:
@@ -424,6 +534,19 @@ class MyDataloader(DataLoader):
         rank: int = 0,
         noisy_proportion: float = 0.75,
         use_room_conditioning: bool = False,
+        volume_mode: str = "drop",
+        volume_constant: float = 0.5,
+        volume_shuffle_seed: int = 2024,
+        rir_corrupt_enabled: bool = False,
+        rir_corrupt_p: float = 0.8,
+        rir_corrupt_trunc_s: Tuple[float, float] = (0.85, 1.15),
+        rir_corrupt_fade_ms: float = 20.0,
+        rir_corrupt_noise_db: Tuple[float, float] = (-58.0, -50.0),
+        rir_corrupt_hp_hz: Tuple[float, float] = (50.0, 100.0),
+        rir_corrupt_tilt_db: Tuple[float, float] = (-4.5, -2.5),
+        rir_corrupt_smear_ms: Tuple[float, float] = (0.5, 1.5),
+        rir_corrupt_scatter_gain: Tuple[float, float] = (0.7, 1.0),
+        rir_corrupt_scatter_ma: Tuple[int, int] = (3, 9),
         *args,
         **kwargs
     ) -> DataLoader:
@@ -463,6 +586,29 @@ class MyDataloader(DataLoader):
         self.rad_resolution = rad_resolution
         self.num_workers = num_workers
         self.use_room_conditioning = use_room_conditioning
+        self.volume_mode = str(volume_mode or "drop").strip().lower()
+        self.volume_constant = float(volume_constant)
+        self.volume_shuffle_seed = int(volume_shuffle_seed)
+        if rir_corrupt_enabled:
+            from .rir_corrupt import CorruptConfig
+
+            self.rir_corrupt = CorruptConfig.from_kwargs(
+                {
+                    "sr": sr,
+                    "rir_corrupt_enabled": rir_corrupt_enabled,
+                    "rir_corrupt_p": rir_corrupt_p,
+                    "rir_corrupt_trunc_s": rir_corrupt_trunc_s,
+                    "rir_corrupt_fade_ms": rir_corrupt_fade_ms,
+                    "rir_corrupt_noise_db": rir_corrupt_noise_db,
+                    "rir_corrupt_hp_hz": rir_corrupt_hp_hz,
+                    "rir_corrupt_tilt_db": rir_corrupt_tilt_db,
+                    "rir_corrupt_smear_ms": rir_corrupt_smear_ms,
+                    "rir_corrupt_scatter_gain": rir_corrupt_scatter_gain,
+                    "rir_corrupt_scatter_ma": rir_corrupt_scatter_ma,
+                }
+            )
+        else:
+            self.rir_corrupt = None
         self.seeds = []
         for seed in seeds:
             self.seeds.append(seed if seed is not None else random.randint(0, 1000000))
@@ -486,6 +632,7 @@ class MyDataloader(DataLoader):
         rir_shuffle,
         repeat,
         sampler: bool,
+        rir_corrupt=None,
     ):
         ds = MyDataset(
             src_path_txt,
@@ -503,8 +650,16 @@ class MyDataloader(DataLoader):
             max_rad_value=self.max_rad_value,
             rad_resolution=self.rad_resolution,
             use_room_conditioning=self.use_room_conditioning,
+            rir_corrupt=rir_corrupt,
+            volume_mode=self.volume_mode,
+            volume_constant=self.volume_constant,
+            volume_shuffle_seed=self.volume_shuffle_seed,
         )
 
+        # DataLoader forbids prefetch_factor / persistent_workers when num_workers==0
+        # (common on pods with tiny /dev/shm where multiprocessing is unusable).
+        prefetch = self.prefetch_factor if self.num_workers > 0 else None
+        persistent = self.persistent_workers if self.num_workers > 0 else False
         return DataLoader(
             ds,
             sampler=(
@@ -516,9 +671,9 @@ class MyDataloader(DataLoader):
             ),  #
             batch_size=batchsize,  #
             num_workers=self.num_workers,
-            prefetch_factor=self.prefetch_factor,
+            prefetch_factor=prefetch,
             pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
+            persistent_workers=persistent,
             drop_last=True,
         )
 
@@ -535,6 +690,7 @@ class MyDataloader(DataLoader):
             rir_shuffle=True,
             sampler=True,
             repeat=True,
+            rir_corrupt=self.rir_corrupt,
         )
 
     def build_valid_dataloader(self) -> DataLoader:

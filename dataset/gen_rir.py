@@ -308,19 +308,38 @@ def _room_fits_edge_mic(
     return inner_w > 2.0 * req_margin and inner_h > w + 2.0 * req_margin
 
 
+def _clip_mic_zlim_to_room(
+    mic_zlim: Tuple[float, float],
+    room_sz: Union[List[float], np.ndarray],
+    min_dist_to_wall: float = 0.0,
+) -> Optional[Tuple[float, float]]:
+    """Intersect mic_zlim with the room Z range (optionally inset by min_dist_to_wall)."""
+    Lz = float(room_sz[2])
+    z_lo = max(float(mic_zlim[0]), float(min_dist_to_wall))
+    z_hi = min(float(mic_zlim[1]), Lz - float(min_dist_to_wall))
+    if z_hi < z_lo:
+        return None
+    return (z_lo, z_hi)
+
+
 def _sample_mic_center_on_edge(
     room_sz: Union[List[float], np.ndarray],
     mic_wall_offset: float,
-    mic_z_height: float,
+    mic_z_height: Optional[float],
     req_margin: float,
     mic_edge_width: float = 0.0,
     corner_eps: float = 1e-3,
+    mic_zlim: Optional[Tuple[float, float]] = None,
+    min_dist_to_wall: float = 0.0,
 ) -> Optional[np.ndarray]:
     """Sample mic array center in the low-y x-parallel edge band (y0 region).
 
     ``x`` is uniform along the inset edge from ``x = o`` to ``x = Lx - o``.
     ``y`` is uniform in ``[o, o + mic_edge_width]`` (or fixed at ``o`` when width is 0).
-    Matches folded angle labels in [0, 180] deg.  Z is fixed.
+    Matches folded angle labels in [0, 180] deg.
+
+    Z: if ``mic_zlim`` is provided, sample uniformly from ``mic_zlim`` clipped to the
+    room (and ``min_dist_to_wall``); otherwise use fixed ``mic_z_height``.
     Returns None when the room is too small for the offset, band width, and margins.
     """
     Lx, Ly, Lz = float(room_sz[0]), float(room_sz[1]), float(room_sz[2])
@@ -328,8 +347,6 @@ def _sample_mic_center_on_edge(
     w = float(mic_edge_width)
     geom_tol = 1e-4
     if o < req_margin or not _room_fits_edge_mic(room_sz, o, req_margin, w):
-        return None
-    if not (0.0 <= mic_z_height <= Lz):
         return None
     if o + w > Ly - req_margin - geom_tol:
         return None
@@ -339,29 +356,49 @@ def _sample_mic_center_on_edge(
     inner_w = Lx - 2.0 * o
     if inner_w <= 2.0 * corner_eps:
         return None
+    if mic_zlim is not None:
+        z_span = _clip_mic_zlim_to_room(mic_zlim, room_sz, min_dist_to_wall)
+        if z_span is None:
+            return None
+        z = float(uniform(z_span[0], z_span[1]))
+    else:
+        if mic_z_height is None:
+            return None
+        if not (0.0 <= float(mic_z_height) <= Lz):
+            return None
+        z = float(mic_z_height)
     x = float(uniform(o + corner_eps, Lx - o - corner_eps))
     y = float(uniform(o, o + w)) if w > 0.0 else o
-    return np.array([x, y, float(mic_z_height)], dtype=np.float64)
+    return np.array([x, y, z], dtype=np.float64)
 
 
 def _is_mic_edge_valid_for_room(
     mic_center: np.ndarray,
     room_sz: List[float],
     mic_wall_offset: float,
-    mic_z_height: float,
+    mic_z_height: Optional[float],
     req_margin: float,
     mic_edge_width: float = 0.0,
     tol: float = 1e-4,
+    mic_zlim: Optional[Tuple[float, float]] = None,
+    min_dist_to_wall: float = 0.0,
 ) -> bool:
-    """Validate mic in the y0 edge band [o, o+mic_edge_width] and constant height."""
+    """Validate mic in the y0 edge band [o, o+mic_edge_width] and allowed height."""
     o = float(mic_wall_offset)
     w = float(mic_edge_width)
     if o < req_margin or not _room_fits_edge_mic(room_sz, o, req_margin, w):
         return False
     Lx, Ly, Lz = room_sz
     x, y, z = mic_center.tolist()
-    if abs(z - float(mic_z_height)) > tol or not (0.0 <= z <= Lz):
-        return False
+    if mic_zlim is not None:
+        z_span = _clip_mic_zlim_to_room(mic_zlim, room_sz, min_dist_to_wall)
+        if z_span is None or z < z_span[0] - tol or z > z_span[1] + tol:
+            return False
+    else:
+        if mic_z_height is None:
+            return False
+        if abs(z - float(mic_z_height)) > tol or not (0.0 <= z <= Lz):
+            return False
     if w <= 0.0:
         if abs(y - o) > tol:
             return False
@@ -729,7 +766,9 @@ def generate_rir_cfg_list(
     mic_center_list: Optional[List[List[float]]] = None,
     mic_wall_offset: Optional[float] = 1.5,
     mic_edge_width: float = 0.4,
-    mic_z_height: float = 2.0,
+    mic_z_height: Optional[float] = 2.0,
+    edge_mic_z_from_lim: bool = False,
+    max_src_elevation_deg: Optional[float] = None,
     restrict_src_to_inward_halfspace: bool = False,
     max_src_tries: int = 1000,
     uniform_angle_radius: bool = False,
@@ -768,8 +807,12 @@ def generate_rir_cfg_list(
         mic_edge_width: width (m) of the low-y edge band for mic placement. y is uniform
             in [mic_wall_offset, mic_wall_offset + mic_edge_width]. Set to 0 for a single
             line at y = mic_wall_offset. Default 0.4 m.
-        mic_z_height: constant microphone center height (m) when using mic_wall_offset.
-            mic_zlim is not used in edge mode.
+        mic_z_height: constant microphone center height (m) when using mic_wall_offset
+            and edge_mic_z_from_lim is False (backward-compatible fixed-height path).
+        edge_mic_z_from_lim: if True (edge mode only), sample mic Z from mic_zlim clipped
+            to each room (with min_dist_to_wall inset). mic_z_height is ignored.
+        max_src_elevation_deg: if set, reject sources whose |elevation| vs the mic center
+            exceeds this many degrees (elevation = atan2(dz, hypot(dx, dy))).
         uniform_angle_radius: if True, sample source positions in polar coordinates
             around mic_center so that the folded angle (in [0, 180] deg, matching
             compute_angle_radius with room_sz) and the radius (in meters) are each
@@ -932,15 +975,37 @@ def generate_rir_cfg_list(
                     f"Need min(Lx, Ly) >= {need_xy:.2f} m."
                 )
             zlo, zhi = float(room_size_lims[2][0]), float(room_size_lims[2][1])
-            if float(mic_z_height) < 0.0 or float(mic_z_height) > zhi:
-                raise ValueError(
-                    f"mic_z_height={mic_z_height} must be in [0, {zhi}] (max sampled room height); "
-                    f"room_size_lims z is [{zlo}, {zhi}] for room Lz, not mic height."
-                )
-            if float(mic_z_height) > zlo:
+            if edge_mic_z_from_lim:
+                mz_lo, mz_hi = float(mic_zlim[0]), float(mic_zlim[1])
+                if mz_hi < mz_lo:
+                    raise ValueError(f"mic_zlim must have lo<=hi, got {mic_zlim}.")
+                if mz_lo < 0.0 or mz_hi > zhi:
+                    print(
+                        f"  NOTE: mic_zlim=[{mz_lo}, {mz_hi}] vs room z [{zlo}, {zhi}] — "
+                        f"per-room clipping applies; rooms that cannot host any mic Z are resampled."
+                    )
                 print(
-                    f"  NOTE: mic_z_height={mic_z_height} m exceeds minimum room height "
-                    f"{zlo} m — rooms with Lz < {mic_z_height} will be resampled."
+                    f"  edge-mic z sampled from mic_zlim=[{mz_lo}, {mz_hi}] m, clipped to each room "
+                    f"(min_dist_to_wall={min_dist_to_wall} m). mic_z_height={mic_z_height} is ignored."
+                )
+            else:
+                if mic_z_height is None:
+                    raise ValueError(
+                        "mic_z_height is required in edge mode unless edge_mic_z_from_lim=True."
+                    )
+                if float(mic_z_height) < 0.0 or float(mic_z_height) > zhi:
+                    raise ValueError(
+                        f"mic_z_height={mic_z_height} must be in [0, {zhi}] (max sampled room height); "
+                        f"room_size_lims z is [{zlo}, {zhi}] for room Lz, not mic height."
+                    )
+                if float(mic_z_height) > zlo:
+                    print(
+                        f"  NOTE: mic_z_height={mic_z_height} m exceeds minimum room height "
+                        f"{zlo} m — rooms with Lz < {mic_z_height} will be resampled."
+                    )
+            if max_src_elevation_deg is not None and float(max_src_elevation_deg) <= 0:
+                raise ValueError(
+                    f"max_src_elevation_deg must be > 0 when set; got {max_src_elevation_deg}."
                 )
 
         if os.path.exists(save_to):
@@ -1040,7 +1105,9 @@ def generate_rir_cfg_list(
     use_edge_mic = mic_wall_offset is not None
     edge_offset = float(mic_wall_offset) if use_edge_mic else None
     edge_width = float(mic_edge_width) if use_edge_mic else 0.0
-    edge_z = float(mic_z_height)
+    edge_free_z = bool(use_edge_mic and edge_mic_z_from_lim)
+    edge_z = None if edge_free_z else (float(mic_z_height) if mic_z_height is not None else None)
+    edge_zlim = tuple(mic_zlim) if edge_free_z else None
 
     # Determine array extent in XY (max distance from center to any mic), which is the key constraint
     # for keeping a fixed mic array inside room boundaries.
@@ -1082,13 +1149,26 @@ def generate_rir_cfg_list(
         room_sz = [uniform(*xlim), uniform(*ylim), uniform(*zlim)]  # sample a room
         if use_edge_mic:
             mic_center = _sample_mic_center_on_edge(
-                room_sz, edge_offset, edge_z, req_margin, edge_width
+                room_sz,
+                edge_offset,
+                edge_z,
+                req_margin,
+                edge_width,
+                mic_zlim=edge_zlim,
+                min_dist_to_wall=min_dist_to_wall,
             )
 
         def _mic_placement_ok() -> bool:
             if use_edge_mic:
                 return mic_center is not None and _is_mic_edge_valid_for_room(
-                    mic_center, room_sz, edge_offset, edge_z, req_margin, edge_width
+                    mic_center,
+                    room_sz,
+                    edge_offset,
+                    edge_z,
+                    req_margin,
+                    edge_width,
+                    mic_zlim=edge_zlim,
+                    min_dist_to_wall=min_dist_to_wall,
                 )
             if mic_center is not None:
                 return _is_mic_center_valid_for_room(mic_center, room_sz, req_margin)
@@ -1099,7 +1179,13 @@ def generate_rir_cfg_list(
             RT60 = uniform(*RT60_lim)
             if use_edge_mic:
                 mic_center = _sample_mic_center_on_edge(
-                    room_sz, edge_offset, edge_z, req_margin, edge_width
+                    room_sz,
+                    edge_offset,
+                    edge_z,
+                    req_margin,
+                    edge_width,
+                    mic_zlim=edge_zlim,
+                    min_dist_to_wall=min_dist_to_wall,
                 )
     # sample abs_weights then compute reflection coefficients
     abs_weights = [uniform(*abs_lim) for abs_lim in wall_abs_weights_lims]
@@ -1117,7 +1203,13 @@ def generate_rir_cfg_list(
                 f"Failed to place edge mic (index={index}, room_sz={room_sz}, "
                 f"mic_wall_offset={edge_offset}, req_margin={req_margin:.3f})."
             )
-        if not (0.0 <= edge_z <= room_sz[2]):
+        if edge_free_z:
+            if _clip_mic_zlim_to_room(edge_zlim, room_sz, min_dist_to_wall) is None:
+                raise ValueError(
+                    f"edge_mic_z_from_lim: mic_zlim={edge_zlim} has empty intersection "
+                    f"with room z-range [0,{room_sz[2]}] (min_dist_to_wall={min_dist_to_wall})."
+                )
+        elif edge_z is None or not (0.0 <= edge_z <= room_sz[2]):
             raise ValueError(
                 f"mic_z_height={edge_z} is outside room z-range [0,{room_sz[2]}]."
             )
@@ -1279,6 +1371,12 @@ def generate_rir_cfg_list(
                     continue
                 if wall_pred is not None and not wall_pred(cand):
                     continue
+                if max_src_elevation_deg is not None:
+                    dxyz = cand - mic_center
+                    r_xy = float(np.hypot(dxyz[0], dxyz[1]))
+                    elev = float(np.degrees(np.arctan2(dxyz[2], max(r_xy, 1e-9))))
+                    if abs(elev) > float(max_src_elevation_deg):
+                        continue
                 return cand
             return None
 
@@ -1342,6 +1440,14 @@ def generate_rir_cfg_list(
                 )
             pos_src[iiii, :] = cand
     else:
+        def _elev_ok(pos: np.ndarray) -> bool:
+            if max_src_elevation_deg is None or mic_center is None:
+                return True
+            dxyz = pos - mic_center
+            r_xy = float(np.hypot(dxyz[0], dxyz[1]))
+            elev = float(np.degrees(np.arctan2(dxyz[2], max(r_xy, 1e-9))))
+            return abs(elev) <= float(max_src_elevation_deg)
+
         for iiii in range(0, spk_num):
             tries = 0
             while True:
@@ -1358,6 +1464,14 @@ def generate_rir_cfg_list(
                             f"Try increasing room_size_lims, adjusting mic_center, or disabling restrict_src_to_inward_halfspace."
                         )
                     continue
+                if not _elev_ok(pos_src[iiii, :]):
+                    tries += 1
+                    if tries >= max_src_tries:
+                        raise RuntimeError(
+                            f"Failed to sample a source within max_src_elevation_deg={max_src_elevation_deg} "
+                            f"after {max_src_tries} tries."
+                        )
+                    continue
                 break
             if spk_arr_dist == "random":
                 continue
@@ -1365,6 +1479,7 @@ def generate_rir_cfg_list(
                 norm(pos_src[iiii, :] - mic_center) < spk_arr_dist[0]
                 or norm(pos_src[iiii, :] - mic_center) > spk_arr_dist[1]
                 or (wall_pred is not None and (not wall_pred(pos_src[iiii, :])))
+                or (not _elev_ok(pos_src[iiii, :]))
             ):
                 # if the spk_mic_dis requirements are not satisfied, then resample a position
                 pos_src[iiii, :] = (
@@ -1409,10 +1524,15 @@ def generate_rir_files(
     use_gpu: bool,
     write_localization_csv: bool = True,
     localization_csv_path: Optional[str] = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    force: bool = False,
 ):
     train_rir_num, val_rir_num, test_rir_num = rir_nums
 
     pars = rir_cfg["rir_pars"]
+    if isinstance(pars, np.ndarray):
+        pars = list(pars)
     fs = rir_cfg["args"].item()["fs"]
     attn_diff_speech = rir_cfg["args"].item()["attn_diff"]
     attn_diff_noise = None
@@ -1422,15 +1542,30 @@ def generate_rir_files(
         attn_diff_noise = attn_diff_speech[1]
         attn_diff_speech = attn_diff_speech[0]
 
+    if shard_count < 1:
+        raise ValueError(f"shard_count must be >= 1, got {shard_count}.")
+    if not (0 <= int(shard_index) < int(shard_count)):
+        raise ValueError(
+            f"shard_index must be in [0, shard_count), got shard_index={shard_index}, shard_count={shard_count}."
+        )
+    if int(shard_count) > 1:
+        pars = [p for p in pars if int(p["index"]) % int(shard_count) == int(shard_index)]
+        print(
+            f"[shard] generating {len(pars)} RIRs for shard_index={shard_index}/{shard_count}"
+        )
+
     if (
         (Path(rir_dir) / "train").exists()
         or (Path(rir_dir) / "validation").exists()
         or (Path(rir_dir) / "test").exists()
     ):
-        ans = input("dir " + rir_dir + " exists, still generate rir?(y/n)")
-        assert ans in ["y", "n"], ans
-        if ans == "n":
-            return
+        if force or os.environ.get("GEN_RIR_FORCE", "").lower() in ("1", "true", "yes", "y"):
+            print(f"dir {rir_dir} exists — continuing (force/GEN_RIR_FORCE).")
+        else:
+            ans = input("dir " + rir_dir + " exists, still generate rir?(y/n)")
+            assert ans in ["y", "n"], ans
+            if ans == "n":
+                return
     else:
         os.makedirs(rir_dir, exist_ok=True)
 
@@ -1534,11 +1669,16 @@ def generate_rir_files(
             pbar.update()
             __gen__(par=par, fs=fs, use_gpu=use_gpu)
 
-    if write_localization_csv:
+    # Localization CSV covers the full cfg (all shards). Only shard 0 writes it so
+    # parallel GPU shards do not race; re-run with shard_count=1 if you need a refresh.
+    if write_localization_csv and int(shard_index) == 0:
+        all_pars = rir_cfg["rir_pars"]
+        if isinstance(all_pars, np.ndarray):
+            all_pars = list(all_pars)
         if not localization_csv_path:
             localization_csv_path = os.path.join(rir_dir, "rir_localization.csv")
         rows = []
-        for par in pars:
+        for par in all_pars:
             index = par["index"]
             if index < train_rir_num:
                 setdir = "train"
@@ -1983,6 +2123,24 @@ if __name__ == "__main__":
         help="output CSV path (default: <rir_dir>/rir_localization.csv)",
     )
     parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="GPU/process shard index in [0, shard_count)",
+    )
+    parser.add_argument(
+        "--shard_count",
+        type=int,
+        default=1,
+        help="number of parallel shards (index %% shard_count == shard_index)",
+    )
+    parser.add_argument(
+        "--force",
+        type=bool,
+        default=False,
+        help="continue if rir_dir already has train/validation/test (non-interactive)",
+    )
+    parser.add_argument(
         "-c", "--config", required=False, type=str, help="Configuration .json file"
     )
     # NOTE: mic_center / restrict_src_to_inward_halfspace / max_src_tries are exposed via add_function_arguments(generate_rir_cfg_list)
@@ -2019,6 +2177,9 @@ if __name__ == "__main__":
         use_gpu=args.use_gpu,
         write_localization_csv=args.write_localization_csv,
         localization_csv_path=args.localization_csv_path,
+        shard_index=int(getattr(args, "shard_index", 0) or 0),
+        shard_count=int(getattr(args, "shard_count", 1) or 1),
+        force=bool(getattr(args, "force", False)),
     )
 
     # Sanity-check plot: verifies that the (angle, radius) marginals are flat
@@ -2056,6 +2217,8 @@ usage:
  Uniform angle + full-room radius (y0 edge band, default mic_edge_width=0.4):
  python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 0.4 --mic_edge_width 0.4 --mic_z_height 2.0 --spk_zlim '[1,2]' --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[100000,5000,5000]' --fs 16000 --seed 2024 --rir_dir /storage/reie/data/rec-rir/rir-uniform-angle-fullroom-edge-y0-band
  # Line-only mic (w=0): add --mic_edge_width 0
+ # Free mic Z from mic_zlim (edge mode) + optional elevation reject + 2-GPU shards:
+ python gen_rir.py --room_size_lims '[[3,15],[3,15],[2.5,6]]' --mic_wall_offset 0.2 --mic_edge_width 0.9 --edge_mic_z_from_lim true --mic_zlim '[0.8,2.0]' --spk_zlim '[0.5,2.2]' --max_src_elevation_deg 35 --RT60_lim '[0.2,1.5]' --spk_arr_dist '[0.3,null]' --restrict_src_to_inward_halfspace true --uniform_angle_radius true --rir_nums '[50000,2500,2500]' --fs 16000 --seed 2033 --force true --shard_index 0 --shard_count 2 --rir_dir /storage/reie/data/rec-rir/rir-...-miczfree-s2033
  # Or use the config file:
  python gen_rir.py -c /storage/reie/data/rec-rir/rir-uniform-angle-fullroom/config.json
 """

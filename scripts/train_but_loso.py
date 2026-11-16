@@ -20,6 +20,11 @@ Gates (not MAE alone):
 Default: freeze the trunk, train loc heads (+ head FiLM). Pass --freeze none
 to unfreeze everything.
 
+Optional Arm-B mix: ``--mix-synth-csv`` (+ optional ``--mix-synth-list``) appends
+labeled gpuRIR ``.npz`` entries into each fold's *train* set only. Real
+train/test membership is unchanged. Default mix ratio 1.0 → equal #synth as
+#real train RIRs (50/50 by count).
+
 Usage (from REC-RIR-LOCALIZATION):
   /storage/reie/.venv_custom_ssh/bin/python scripts/train_but_loso.py
   /storage/reie/.venv_custom_ssh/bin/python scripts/train_but_loso.py --split room
@@ -36,6 +41,7 @@ import csv
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +96,15 @@ def _mic_id(row: dict) -> str:
     if not mic:
         raise ValueError(f"cannot infer mic id from row keys {sorted(row)}")
     return mic
+
+
+def _source_id(row: dict) -> str:
+    src = str(row.get("spk_setup") or row.get("source_id") or row.get("speaker") or "")
+    if not src:
+        # Fallback: <room>/<mic>/<speaker>/RIR.wav → speaker is parent of RIR dir's parent… 
+        # entries store sample path indirectly; prefer spk_setup from loader.
+        raise ValueError(f"cannot infer source id from row keys {sorted(row)}")
+    return src
 
 
 def _array_key(row: dict) -> str:
@@ -259,8 +274,265 @@ def _mic_fraction_jobs(
     return jobs
 
 
+def _mic_source_fraction_jobs(
+    entries: list[dict],
+    mic_train_fracs: list[float],
+    src_train_fracs: list[float],
+    draws: int,
+    seed: int,
+) -> list[dict]:
+    """Product holdout over mic IDs × source IDs.
+
+    Train only on train-mics × train-sources. Primary test is the joint corner
+    hold-mics × hold-sources. Extra eval_sets cover the other three quadrants
+    for diagnostics (seen-mic/new-src, new-mic/seen-src, sanity ceiling).
+    """
+    mic_ids = sorted({_mic_id(row) for row in entries})
+    src_ids = sorted({_source_id(row) for row in entries})
+    by_array: dict[str, list[str]] = {}
+    for mic in mic_ids:
+        arr = mic.split("_", 1)[0] if "_" in mic else "mic"
+        by_array.setdefault(arr, []).append(mic)
+    arrays = sorted(by_array)
+    if not arrays:
+        raise ValueError("no microphone IDs found for mic×source split")
+    if len(src_ids) < 2:
+        raise ValueError(f"need >=2 sources for source holdout, got {src_ids}")
+
+    jobs: list[dict] = []
+    seen: set[tuple[float, float, tuple[str, ...], tuple[str, ...]]] = set()
+    for mic_frac in mic_train_fracs:
+        if not (0.0 < mic_frac < 1.0):
+            raise ValueError(f"mic train fraction must be in (0, 1), got {mic_frac}")
+        for src_frac in src_train_fracs:
+            if not (0.0 < src_frac < 1.0):
+                raise ValueError(f"source train fraction must be in (0, 1), got {src_frac}")
+            for draw in range(draws):
+                rng = np.random.default_rng(
+                    seed
+                    + 1009 * draw
+                    + int(round(mic_frac * 10000))
+                    + 17 * int(round(src_frac * 10000))
+                )
+                train_mics: list[str] = []
+                for arr in arrays:
+                    mics = by_array[arr]
+                    n_train = int(round(mic_frac * len(mics)))
+                    n_train = min(max(1, n_train), len(mics) - 1)
+                    pick = sorted(rng.choice(mics, size=n_train, replace=False).tolist())
+                    train_mics.extend(pick)
+                n_src_train = int(round(src_frac * len(src_ids)))
+                n_src_train = min(max(1, n_src_train), len(src_ids) - 1)
+                train_srcs = sorted(
+                    rng.choice(src_ids, size=n_src_train, replace=False).tolist()
+                )
+                train_mics_t = tuple(sorted(train_mics))
+                train_srcs_t = tuple(train_srcs)
+                key = (round(mic_frac, 6), round(src_frac, 6), train_mics_t, train_srcs_t)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                train_mic_set = set(train_mics)
+                train_src_set = set(train_srcs)
+                hold_mics = sorted(set(mic_ids) - train_mic_set)
+                hold_srcs = sorted(set(src_ids) - train_src_set)
+
+                def _pick(mics: set[str], srcs: set[str]) -> list[dict]:
+                    return [
+                        dict(r)
+                        for r in entries
+                        if _mic_id(r) in mics and _source_id(r) in srcs
+                    ]
+
+                train_entries = _pick(train_mic_set, train_src_set)
+                q_tm_ts = train_entries
+                q_tm_hs = _pick(train_mic_set, set(hold_srcs))
+                q_hm_ts = _pick(set(hold_mics), train_src_set)
+                q_hm_hs = _pick(set(hold_mics), set(hold_srcs))
+                if not train_entries or not q_hm_hs:
+                    continue
+                jobs.append(
+                    {
+                        "hold": (
+                            f"mic{mic_frac:.2f}_src{src_frac:.2f}_d{draw:02d}"
+                            f"_holdM_{'+'.join(hold_mics)}"
+                            f"_holdS_{'+'.join(hold_srcs)}"
+                        ),
+                        "mic": None,
+                        "draw": draw,
+                        "train_frac": mic_frac,
+                        "src_train_frac": src_frac,
+                        "train_mics": sorted(train_mics),
+                        "test_mics": hold_mics,
+                        "train_srcs": train_srcs,
+                        "test_srcs": hold_srcs,
+                        "train_entries": train_entries,
+                        "test_entries": q_hm_hs,  # primary: joint holdout
+                        "donor_entries": train_entries,
+                        "eval_sets": {
+                            "train_mic_train_src": q_tm_ts,
+                            "train_mic_hold_src": q_tm_hs,
+                            "hold_mic_train_src": q_hm_ts,
+                            "hold_mic_hold_src": q_hm_hs,
+                        },
+                    }
+                )
+    if not jobs:
+        raise ValueError("no mic×source jobs generated")
+    return jobs
+
+
+# dEchorate paper Table-5 RT60s cluster into three clear bands (unique values):
+#   low  <0.20 → {0.14, 0.18, 0.19}
+#   mid  [0.20, 0.45) → {0.26, 0.33, 0.34}
+#   high ≥0.45 → {0.56, 0.73}
+_RT60_BAND_EDGES: tuple[tuple[str, float, float], ...] = (
+    ("low", 0.0, 0.20),
+    ("mid", 0.20, 0.45),
+    ("high", 0.45, float("inf")),
+)
+
+
+def _rt60_band(rt60: float) -> str:
+    for name, lo, hi in _RT60_BAND_EDGES:
+        if lo <= float(rt60) < hi:
+            return name
+    raise ValueError(f"RT60 {rt60} falls outside configured bands")
+
+
+def _rt60_band_jobs(entries: list[dict]) -> list[dict]:
+    """Leave-one-RT60-band-out (3 folds: hold low / mid / high).
+
+    Primary test = held band. ``eval_sets`` also scores the train-band corner
+    so in-distribution recovery can be compared to the holdout failure mode.
+    """
+    by_band: dict[str, list[dict]] = {name: [] for name, _, _ in _RT60_BAND_EDGES}
+    for row in entries:
+        band = _rt60_band(float(row["rt60"]))
+        by_band[band].append(dict(row))
+    missing = [n for n, rows in by_band.items() if not rows]
+    if missing:
+        raise ValueError(f"RT60 bands empty after labeling: {missing}")
+
+    jobs: list[dict] = []
+    for hold_band, _, _ in _RT60_BAND_EDGES:
+        test_entries = by_band[hold_band]
+        train_entries = [
+            dict(r)
+            for band, rows in by_band.items()
+            if band != hold_band
+            for r in rows
+        ]
+        hold_vals = sorted({round(float(r["rt60"]), 4) for r in test_entries})
+        train_vals = sorted({round(float(r["rt60"]), 4) for r in train_entries})
+        jobs.append(
+            {
+                "hold": f"rt60_{hold_band}_hold{hold_vals}_train{train_vals}",
+                "mic": None,
+                "draw": None,
+                "hold_band": hold_band,
+                "train_rt60": train_vals,
+                "test_rt60": hold_vals,
+                "train_entries": train_entries,
+                "test_entries": test_entries,
+                "donor_entries": train_entries,
+                "eval_sets": {
+                    "train_rt60": train_entries,
+                    "hold_rt60": test_entries,
+                },
+            }
+        )
+    return jobs
+
+
 def _read_paths(txt: Path) -> list[str]:
     return [os.path.normpath(line.strip()) for line in txt.read_text().splitlines() if line.strip()]
+
+
+def _load_synth_npz_pool(
+    loc_csv: Path,
+    rir_list: Path | None,
+    max_rad_value: float,
+) -> list[dict]:
+    """CSV angle/radius rows for labeled gpuRIR ``.npz`` (real dEchorate skipped)."""
+    allow: set[str] | None = None
+    if rir_list is not None:
+        allow = {os.path.normpath(p) for p in _read_paths(rir_list)}
+
+    rows: list[dict] = []
+    with loc_csv.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            path = os.path.normpath(str(row["rir_path"]).strip())
+            if allow is not None and path not in allow:
+                continue
+            if "dechorate" in path.lower():
+                continue
+            if not path.lower().endswith(".npz"):
+                continue
+            try:
+                ang = float(row["angle_deg"])
+                rad = float(row["radius_m"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rad > max_rad_value:
+                continue
+            rows.append({"rir_path": path, "angle_deg": ang, "radius_m": rad})
+    if not rows:
+        raise ValueError(f"No synth npz rows under {loc_csv} (list={rir_list})")
+    return rows
+
+
+def _materialize_synth_entries(
+    pool_rows: list[dict],
+    n: int,
+    seed: int,
+) -> list[dict]:
+    """Sample ``n`` synth CSV rows and attach FiLM metadata from each npz."""
+    if n <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    if n >= len(pool_rows):
+        chosen = list(pool_rows)
+        rng.shuffle(chosen)
+    else:
+        idx = rng.choice(len(pool_rows), size=n, replace=False)
+        chosen = [pool_rows[int(i)] for i in idx]
+
+    out: list[dict] = []
+    for row in chosen:
+        path = row["rir_path"]
+        with np.load(path, allow_pickle=False) as z:
+            rt60 = float(np.asarray(z["RT60"]).reshape(-1)[0])
+            room_sz = np.asarray(z["room_sz"], dtype=np.float64).reshape(-1)
+            pos_rcv = np.asarray(z["pos_rcv"], dtype=np.float64).reshape(-1, 3)[0]
+            pos_src = np.asarray(z["pos_src"], dtype=np.float64).reshape(-1, 3)[0]
+        stem = Path(path).stem
+        mic_id = f"synth_{stem}"
+        out.append(
+            {
+                "rir_path": path,
+                "angle_deg": f"{float(row['angle_deg']):.4f}",
+                "radius_m": f"{float(row['radius_m']):.4f}",
+                "rt60": str(rt60),
+                "room_sz_x": str(float(room_sz[0])),
+                "room_sz_y": str(float(room_sz[1])),
+                "room_sz_z": str(float(room_sz[2])),
+                "mic_x": str(float(pos_rcv[0])),
+                "mic_y": str(float(pos_rcv[1])),
+                "mic_z": str(float(pos_rcv[2])),
+                "source_x": str(float(pos_src[0])),
+                "source_y": str(float(pos_src[1])),
+                "source_z": str(float(pos_src[2])),
+                "room": "synth_s2030",
+                "mic_id": mic_id,
+                "group_key": f"synth_s2030/{mic_id}",
+                "spk_setup": "synth",
+                "applied_rotation": "synth",
+                "is_synth": "1",
+            }
+        )
+    return out
 
 
 def _filter_entries(entries: list[dict], max_rad_value: float) -> list[dict]:
@@ -342,6 +614,7 @@ def _score(
     seed: int,
     film_mode: str,
     snr_range: tuple[float, float] = (20.0, 20.0),
+    volume_mode: str = "drop",
 ) -> dict:
     model.eval()
     dataset = ButRirDataset(
@@ -358,6 +631,7 @@ def _score(
         rad_resolution=rad_resolution,
         seed=seed,
         film_mode="normal" if film_mode == "shuffle" else film_mode,
+        volume_mode=volume_mode,
         randomize=False,
     )
     loader = DataLoader(
@@ -369,6 +643,13 @@ def _score(
         persistent_workers=(num_workers > 0),
     )
     rows: list[dict] = []
+    n_total = len(dataset)
+    n_seen = 0
+    t0 = time.time()
+    print(
+        f"  score[{film_mode}] start  n={n_total}  batch={batch_size}  workers={num_workers}",
+        flush=True,
+    )
     for batch in loader:
         reverb_wav, angle_cls_gt, radius_cls_gt, room_params, rir_paths, angle_degs, radius_ms, clip_idxs, group_keys, film_groups = batch
         reverb_wav = reverb_wav.to(device, non_blocking=True)
@@ -400,6 +681,14 @@ def _score(
                     "gt_radius_class": int(radius_cls_gt[b]),
                     "pred_radius_class": int(radius_preds[b]),
                 }
+            )
+        n_seen += B
+        if n_seen == B or n_seen % max(batch_size * 20, 160) == 0 or n_seen >= n_total:
+            elapsed = max(time.time() - t0, 1e-3)
+            print(
+                f"  score[{film_mode}] {n_seen}/{n_total}  "
+                f"{n_seen / elapsed:.1f} samp/s",
+                flush=True,
             )
     grp = np.array([r["group_key"] for r in rows])
     rir = np.array([r["rir_path"] for r in rows])
@@ -566,22 +855,30 @@ def main() -> None:
     p.add_argument("--freeze", choices=("heads", "none"), default="heads")
     p.add_argument(
         "--split",
-        choices=("mic", "room", "array", "mic80", "micfrac", "kshot"),
+        choices=("mic", "room", "array", "mic80", "micfrac", "micsrc", "kshot", "rt60"),
         default="mic",
-        help="Hold out a microphone, room, array, 80/20 mic-id fold, mic-fraction sweep, or k labeled RIRs.",
+        help=(
+            "Hold out a microphone, room, array, 80/20 mic-id fold, mic-fraction "
+            "sweep, mic×source product holdout, RT60 band, or k labeled RIRs."
+        ),
     )
     p.add_argument("--k", type=int, default=2, help="support RIRs per mic for --split kshot")
     p.add_argument("--draws", type=int, default=3, help="random support draws per mic for k-shot")
     p.add_argument(
         "--mic-train-fracs",
         default="0.8,0.6,0.4,0.2",
-        help="Comma-separated train mic fractions for --split micfrac.",
+        help="Comma-separated train mic fractions for --split micfrac / micsrc.",
+    )
+    p.add_argument(
+        "--src-train-fracs",
+        default="0.43,0.71,0.86",
+        help="Comma-separated train source fractions for --split micsrc (≈3/7,5/7,6/7).",
     )
     p.add_argument(
         "--micfrac-draws",
         type=int,
         default=5,
-        help="Balanced random draws per train fraction for --split micfrac.",
+        help="Balanced random draws per train fraction for --split micfrac / micsrc.",
     )
     p.add_argument(
         "--kshot-rooms",
@@ -615,7 +912,11 @@ def main() -> None:
     p.add_argument(
         "--resume",
         action="store_true",
-        help="Skip folds that already have summary.json + pred CSVs; still re-score zero-shot.",
+        help=(
+            "Skip folds that already have summary.json + pred CSVs; still re-score "
+            "zero-shot. If last.pt + pred CSVs exist without summary.json, skip FT "
+            "and finish quadrant scoring from the saved weights."
+        ),
     )
     p.add_argument("--wandb-mode", default="online")
     p.add_argument(
@@ -625,6 +926,25 @@ def main() -> None:
     )
     p.add_argument("--run-name", default="", help="Override wandb run name.")
     p.add_argument("--wandb-group", default="", help="Override wandb group.")
+    p.add_argument(
+        "--mix-synth-csv",
+        default="",
+        help=(
+            "Localization CSV for labeled gpuRIR npz (Arm B). When set, samples "
+            "synth RIRs into each fold's train set only; real membership unchanged."
+        ),
+    )
+    p.add_argument(
+        "--mix-synth-list",
+        default="",
+        help="Optional path list restricting which npz from --mix-synth-csv are eligible.",
+    )
+    p.add_argument(
+        "--mix-ratio",
+        type=float,
+        default=1.0,
+        help="Synth:real train count ratio (1.0 = equal counts / 50-50 by RIR).",
+    )
     args = p.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -654,6 +974,23 @@ def main() -> None:
     eval_speech = _read_paths(root / args.eval_speech)
     noise_paths = _read_paths(root / args.noise) if args.noise else []
 
+    synth_pool: list[dict] | None = None
+    if str(args.mix_synth_csv).strip():
+        mix_csv = Path(args.mix_synth_csv)
+        if not mix_csv.is_absolute():
+            mix_csv = root / mix_csv
+        mix_list = None
+        if str(args.mix_synth_list).strip():
+            mix_list = Path(args.mix_synth_list)
+            if not mix_list.is_absolute():
+                mix_list = root / mix_list
+        synth_pool = _load_synth_npz_pool(mix_csv, mix_list, max_rad_value)
+        print(
+            f"Arm-B synth mix pool: {len(synth_pool)} npz  "
+            f"ratio={args.mix_ratio:.2f}  csv={mix_csv}",
+            flush=True,
+        )
+
     tag = str(args.dataset_tag).strip() or "but"
     if args.split == "kshot":
         rooms = None if args.kshot_rooms.strip().lower() == "all" else [
@@ -673,6 +1010,22 @@ def main() -> None:
         jobs = _mic_fraction_jobs(entries, train_fracs, args.micfrac_draws, args.seed)
         split_name = "mic-ID fraction sweep"
         wandb_group = args.wandb_group.strip() or f"{tag}-micfrac-fewshot"
+    elif args.split == "micsrc":
+        mic_fracs = [
+            float(x.strip()) for x in args.mic_train_fracs.split(",") if x.strip()
+        ]
+        src_fracs = [
+            float(x.strip()) for x in args.src_train_fracs.split(",") if x.strip()
+        ]
+        jobs = _mic_source_fraction_jobs(
+            entries, mic_fracs, src_fracs, args.micfrac_draws, args.seed
+        )
+        split_name = "mic×source fraction sweep"
+        wandb_group = args.wandb_group.strip() or f"{tag}-micsrc-fewshot"
+    elif args.split == "rt60":
+        jobs = _rt60_band_jobs(entries)
+        split_name = "RT60 band leave-one-out"
+        wandb_group = args.wandb_group.strip() or f"{tag}-rt60-holdout"
     else:
         jobs = _loo_jobs(entries, args.split)
         split_name = (
@@ -717,18 +1070,31 @@ def main() -> None:
         job_type="fewshot",
         mode=args.wandb_mode,
         dir=str(exp),
-        tags=[tag, args.split, "fewshot", "zfree", args.freeze],
+        tags=[
+            tag,
+            args.split,
+            "fewshot",
+            "zfree",
+            args.freeze,
+            *(["mix-synth"] if synth_pool is not None else []),
+        ],
         notes=(
             f"{split_name} few-shot on labeled {tag}. "
             "Pooled held-out MAE / r_within / FiLM-shuffle are the gates. "
             "Metrics stay grouped by microphone. "
             f"freeze={args.freeze}."
+            + (
+                f" mix_synth_ratio={args.mix_ratio}."
+                if synth_pool is not None
+                else ""
+            )
         ),
         config={
             "split": args.split,
             "k": args.k,
             "draws": args.draws,
             "mic_train_fracs": args.mic_train_fracs,
+            "src_train_fracs": args.src_train_fracs,
             "micfrac_draws": args.micfrac_draws,
             "freeze": args.freeze,
             "epochs": args.epochs,
@@ -740,6 +1106,10 @@ def main() -> None:
             "n_rirs": len(entries),
             "checkpoint": str(ckpt_path),
             "folds": fold_idx,
+            "mix_synth_csv": args.mix_synth_csv,
+            "mix_synth_list": args.mix_synth_list,
+            "mix_ratio": args.mix_ratio,
+            "n_synth_pool": len(synth_pool) if synth_pool is not None else 0,
         },
     )
 
@@ -747,6 +1117,13 @@ def main() -> None:
     radius_loss = GaussianLabelSmoothingLoss(num_radius, sigma=2.0).to(device)
 
     eval_batch = args.eval_batch if args.eval_batch is not None else args.batch
+    volume_mode = str(
+        config.get("dataloader", {}).get("args", {}).get("volume_mode", "drop")
+    ).strip().lower()
+    print(
+        f"volume_mode={volume_mode}  num_room_params={model_args.get('num_room_params')}",
+        flush=True,
+    )
     score_kw = dict(
         speech_paths=eval_speech,
         noise_paths=[],
@@ -761,6 +1138,7 @@ def main() -> None:
         batch_size=eval_batch,
         num_workers=args.eval_workers,
         seed=args.seed,
+        volume_mode=volume_mode,
     )
 
     pooled_zero_n: list[dict] = []
@@ -781,7 +1159,18 @@ def main() -> None:
     for fi in fold_idx:
         job = jobs[fi]
         hold = job["hold"]
-        train_entries = job["train_entries"]
+        train_entries = list(job["train_entries"])
+        n_real_train = len(train_entries)
+        n_synth_train = 0
+        if synth_pool is not None:
+            n_synth_train = max(0, int(round(n_real_train * float(args.mix_ratio))))
+            synth_entries = _materialize_synth_entries(
+                synth_pool,
+                n_synth_train,
+                seed=args.seed + 17_000 + 97 * fi,
+            )
+            n_synth_train = len(synth_entries)
+            train_entries = train_entries + synth_entries
         test_entries = job["test_entries"]
         donor_entries = job["donor_entries"]
         slug = _safe_slug(hold)
@@ -789,7 +1178,9 @@ def main() -> None:
         fold_dir.mkdir(parents=True, exist_ok=True)
         print(
             f"\n===== fold {fi} hold-out {hold}  "
-            f"train_rirs={len(train_entries)} test_rirs={len(test_entries)}  "
+            f"train_rirs={n_real_train}"
+            + (f"+{n_synth_train}synth" if n_synth_train else "")
+            + f" test_rirs={len(test_entries)}  "
             f"test_mics={len({r['group_key'] for r in test_entries})} =====",
             flush=True,
         )
@@ -811,6 +1202,7 @@ def main() -> None:
 
         pred_n_path = fold_dir / "preds_normal.csv"
         pred_s_path = fold_dir / "preds_shuffle.csv"
+        last_pt_path = fold_dir / "last.pt"
         if (
             args.resume
             and (fold_dir / "summary.json").exists()
@@ -841,6 +1233,96 @@ def main() -> None:
                 torch.cuda.empty_cache()
             continue
 
+        # Interrupted after FT (last.pt + preds) but before summary/quadrants.
+        if (
+            args.resume
+            and last_pt_path.exists()
+            and pred_n_path.exists()
+            and pred_s_path.exists()
+            and not (fold_dir / "summary.json").exists()
+        ):
+            blob = torch.load(last_pt_path, map_location=device, weights_only=False)
+            model.load_state_dict(blob["model"])
+            last_n = _scored_from_rows(
+                _read_pred_csv(pred_n_path), "normal", max_rad_value, rad_resolution
+            )
+            last_s = _scored_from_rows(
+                _read_pred_csv(pred_s_path), "shuffle", max_rad_value, rad_resolution
+            )
+            pooled_ft_n.extend(_tag_job_rows(last_n["rows"], job))
+            pooled_ft_s.extend(_tag_job_rows(last_s["rows"], job))
+            print(
+                f"  resume wrap from last.pt  "
+                f"{_fmt(_metrics_row(f'fold{fi}-ft-normal', last_n))}",
+                flush=True,
+            )
+            quadrant_metrics: dict[str, dict] = {}
+            eval_sets = job.get("eval_sets") or {}
+            for qname, q_entries in eval_sets.items():
+                if not q_entries:
+                    continue
+                if qname in ("hold_mic_hold_src", "hold_rt60"):
+                    quadrant_metrics[qname] = {
+                        "normal": _metrics_row(f"fold{fi}-{qname}-normal", last_n),
+                        "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", last_s),
+                        "n_rirs": len(q_entries),
+                    }
+                    continue
+                q_n = _score(model, q_entries, film_mode="normal", **score_kw)
+                q_s = _score(
+                    model,
+                    _attach_donors(q_entries, donor_entries),
+                    film_mode="shuffle",
+                    **score_kw,
+                )
+                quadrant_metrics[qname] = {
+                    "normal": _metrics_row(f"fold{fi}-{qname}-normal", q_n),
+                    "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", q_s),
+                    "n_rirs": len(q_entries),
+                }
+                print(
+                    f"  quadrant {qname:22s}  "
+                    f"{quadrant_metrics[qname]['normal']['ang_mae']:6.2f}°  "
+                    f"shuffle {quadrant_metrics[qname]['shuffle']['ang_mae']:6.2f}°  "
+                    f"n={len(q_entries)}",
+                    flush=True,
+                )
+            fold_summaries.append(
+                {
+                    "fold": fi,
+                    "hold": hold,
+                    "split": args.split,
+                    "k": args.k if args.split == "kshot" else None,
+                    "draw": job["draw"],
+                    "train_frac": job.get("train_frac"),
+                    "src_train_frac": job.get("src_train_frac"),
+                    "train_mics": job.get("train_mics"),
+                    "test_mics": job.get("test_mics"),
+                    "train_srcs": job.get("train_srcs"),
+                    "test_srcs": job.get("test_srcs"),
+                    "n_train_rirs": n_real_train,
+                    "n_train_rirs_with_synth": len(train_entries),
+                    "n_synth_train": n_synth_train,
+                    "mix_ratio": float(args.mix_ratio) if synth_pool is not None else 0.0,
+                    "n_test_rirs": len(test_entries),
+                    "n_test_mics": len({r["group_key"] for r in test_entries}),
+                    "zero_normal": z_n_row,
+                    "zero_shuffle": z_s_row,
+                    "ft_normal": _metrics_row(f"fold{fi}-ft-normal", last_n),
+                    "ft_shuffle": _metrics_row(f"fold{fi}-ft-shuffle", last_s),
+                    "quadrants": quadrant_metrics,
+                    "history": [],
+                    "resumed_wrap_from_last_pt": True,
+                }
+            )
+            (fold_dir / "summary.json").write_text(
+                json.dumps(fold_summaries[-1], indent=2, default=str)
+            )
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
+
         train_set = ButRirDataset(
             entries=train_entries,
             speech_paths=train_speech,
@@ -854,6 +1336,7 @@ def main() -> None:
             max_rad_value=max_rad_value,
             rad_resolution=rad_resolution,
             seed=args.seed + 1000 * fi,
+            volume_mode=volume_mode,
             randomize=True,
         )
         train_loader = DataLoader(
@@ -931,6 +1414,39 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(last_s["rows"])
 
+        quadrant_metrics: dict[str, dict] = {}
+        eval_sets = job.get("eval_sets") or {}
+        for qname, q_entries in eval_sets.items():
+            if not q_entries:
+                continue
+            # Primary holdout already scored as last_n / last_s.
+            if qname in ("hold_mic_hold_src", "hold_rt60"):
+                quadrant_metrics[qname] = {
+                    "normal": _metrics_row(f"fold{fi}-{qname}-normal", last_n),
+                    "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", last_s),
+                    "n_rirs": len(q_entries),
+                }
+                continue
+            q_n = _score(model, q_entries, film_mode="normal", **score_kw)
+            q_s = _score(
+                model,
+                _attach_donors(q_entries, donor_entries),
+                film_mode="shuffle",
+                **score_kw,
+            )
+            quadrant_metrics[qname] = {
+                "normal": _metrics_row(f"fold{fi}-{qname}-normal", q_n),
+                "shuffle": _metrics_row(f"fold{fi}-{qname}-shuffle", q_s),
+                "n_rirs": len(q_entries),
+            }
+            print(
+                f"  quadrant {qname:22s}  "
+                f"{quadrant_metrics[qname]['normal']['ang_mae']:6.2f}°  "
+                f"shuffle {quadrant_metrics[qname]['shuffle']['ang_mae']:6.2f}°  "
+                f"n={len(q_entries)}",
+                flush=True,
+            )
+
         fold_summaries.append(
             {
                 "fold": fi,
@@ -939,15 +1455,22 @@ def main() -> None:
                 "k": args.k if args.split == "kshot" else None,
                 "draw": job["draw"],
                 "train_frac": job.get("train_frac"),
+                "src_train_frac": job.get("src_train_frac"),
                 "train_mics": job.get("train_mics"),
                 "test_mics": job.get("test_mics"),
-                "n_train_rirs": len(train_entries),
+                "train_srcs": job.get("train_srcs"),
+                "test_srcs": job.get("test_srcs"),
+                "n_train_rirs": n_real_train,
+                "n_train_rirs_with_synth": len(train_entries),
+                "n_synth_train": n_synth_train,
+                "mix_ratio": float(args.mix_ratio) if synth_pool is not None else 0.0,
                 "n_test_rirs": len(test_entries),
                 "n_test_mics": len({r["group_key"] for r in test_entries}),
                 "zero_normal": z_n_row,
                 "zero_shuffle": z_s_row,
                 "ft_normal": _metrics_row(f"fold{fi}-ft-normal", last_n),
                 "ft_shuffle": _metrics_row(f"fold{fi}-ft-shuffle", last_s),
+                "quadrants": quadrant_metrics,
                 "history": history,
             }
         )
@@ -979,6 +1502,11 @@ def main() -> None:
         f"ckpt={ckpt_path}",
         f"split={args.split}  freeze={args.freeze}  epochs={args.epochs}  lr={args.lr}",
         f"train clips/RIR={args.clips_train}  eval clips/RIR={args.clips_eval}",
+        (
+            f"mix_synth=on  ratio={args.mix_ratio}  pool={len(synth_pool)}"
+            if synth_pool is not None
+            else "mix_synth=off"
+        ),
         "",
         f"{'condition':28s} {'film':8s} {'ang':>8s} {'rad':>7s}  r_within r_between",
         "-" * 88,

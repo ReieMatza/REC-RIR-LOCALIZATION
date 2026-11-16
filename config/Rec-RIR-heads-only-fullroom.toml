@@ -95,6 +95,7 @@ sr = 16000
 noisy_proportion = 1
 use_room_conditioning = true
 
+volume_mode = "drop"
 [optimizer.args]
 lr = 0.0005
 
@@ -170,7 +171,7 @@ norms = [ "LN", "LN", "LN", "LN", "LN", "LN",]
 full_share = 0
 attention = "mamba(16,4)"
 use_film = true
-num_room_params = 8
+num_room_params = 7
 embedding_type = "1dconv"
 embedding_1dconv_kernel = 5
 # FiLM in the CTF backbone -- must match the warm-start checkpoint's
