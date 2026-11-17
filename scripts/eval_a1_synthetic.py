@@ -293,6 +293,21 @@ def main():
         action="store_true",
         help="Only run chance + fixed1024 (debug)",
     )
+    parser.add_argument(
+        "--skip-fixed1024",
+        action="store_true",
+        help="Skip the fixed 1024-clip @20 dB pass",
+    )
+    parser.add_argument(
+        "--test-speech",
+        default=None,
+        help="Override test speech pathlist (default: config src_pathlist[2])",
+    )
+    parser.add_argument(
+        "--test-noise",
+        default=None,
+        help="Override test noise pathlist (default: config noise_pathlist[2])",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser().absolute()
@@ -362,10 +377,13 @@ def main():
         "chance_training_mean_on_fixed1024": chance_1024,
     }
 
-    # Speech/noise lists: use the same index-2 entries as the locked training config.
-    test_speech = dl_args["src_pathlist"][2]
-    test_noise = dl_args["noise_pathlist"][2]
+    # Speech/noise lists: default to index-2 entries from the locked training config;
+    # optional CLI overrides for hygiene re-evals (C2).
+    test_speech = args.test_speech or dl_args["src_pathlist"][2]
+    test_noise = args.test_noise or dl_args["noise_pathlist"][2]
     test_seq_len = float(dl_args["seq_lenlist"][2])
+    results["corpus"]["speech_lists_effective_test"] = test_speech
+    results["corpus"]["noise_lists_effective_test"] = test_noise
 
     # ---- full test ----
     if not args.skip_full_test:
@@ -411,48 +429,49 @@ def main():
         )
 
     # ---- fixed 1024 @ 20 dB ----
-    fixed_loader, fixed_meta = _build_eval_dataloader(
-        config,
-        snr_range=[20.0, 20.0],
-        rir_pathlist=str(fixed_list_path),
-        src_pathlist=test_speech,
-        noise_pathlist=test_noise,
-        batchsize=args.batchsize,
-        seed=int(args.fixed1024_seed),
-        seq_len=test_seq_len,
-    )
-    fixed_metrics = _eval_model(
-        model,
-        fixed_loader,
-        transformfunc,
-        device,
-        rad_resolution=rad_resolution,
-        use_room_conditioning=use_room,
-        num_samples=1024,
-        desc="fixed1024@20dB",
-    )
-    results["fixed1024_20db"] = {
-        **fixed_metrics,
-        "split": "test-subset-fixed1024",
-        "snr_range_db": [20.0, 20.0],
-        "seed": int(args.fixed1024_seed),
-        "seq_len_s": test_seq_len,
-        "rir_pathlist": str(fixed_list_path),
-        "src_pathlist": test_speech,
-        "noise_pathlist": test_noise,
-        "selection": (
-            "first 1024 paths from reie-test-rir.txt as committed in "
-            "reie-test-rir-fixed1024.txt; dataset then sorts by basename; "
-            "one clip per RIR at fixed SNR 20 dB"
-        ),
-        "batchsize": args.batchsize,
-        "n_rir_in_list": fixed_meta["n_rir"],
-    }
-    print(
-        f"[fixed1024@20dB] n={fixed_metrics['n_clips']} "
-        f"angle={fixed_metrics['angle_mae_deg']:.3f}° "
-        f"dist={fixed_metrics['distance_mae_m']:.3f} m"
-    )
+    if not args.skip_fixed1024:
+        fixed_loader, fixed_meta = _build_eval_dataloader(
+            config,
+            snr_range=[20.0, 20.0],
+            rir_pathlist=str(fixed_list_path),
+            src_pathlist=test_speech,
+            noise_pathlist=test_noise,
+            batchsize=args.batchsize,
+            seed=int(args.fixed1024_seed),
+            seq_len=test_seq_len,
+        )
+        fixed_metrics = _eval_model(
+            model,
+            fixed_loader,
+            transformfunc,
+            device,
+            rad_resolution=rad_resolution,
+            use_room_conditioning=use_room,
+            num_samples=1024,
+            desc="fixed1024@20dB",
+        )
+        results["fixed1024_20db"] = {
+            **fixed_metrics,
+            "split": "test-subset-fixed1024",
+            "snr_range_db": [20.0, 20.0],
+            "seed": int(args.fixed1024_seed),
+            "seq_len_s": test_seq_len,
+            "rir_pathlist": str(fixed_list_path),
+            "src_pathlist": test_speech,
+            "noise_pathlist": test_noise,
+            "selection": (
+                "first 1024 paths from reie-test-rir.txt as committed in "
+                "reie-test-rir-fixed1024.txt; dataset then sorts by basename; "
+                "one clip per RIR at fixed SNR 20 dB"
+            ),
+            "batchsize": args.batchsize,
+            "n_rir_in_list": fixed_meta["n_rir"],
+        }
+        print(
+            f"[fixed1024@20dB] n={fixed_metrics['n_clips']} "
+            f"angle={fixed_metrics['angle_mae_deg']:.3f}° "
+            f"dist={fixed_metrics['distance_mae_m']:.3f} m"
+        )
 
     summary_path = out_dir / "a1_summary.json"
     summary_path.write_text(json.dumps(results, indent=2) + "\n")
@@ -473,17 +492,22 @@ def main():
             f"distance MAE={ft['distance_mae_m']:.4f} m  "
             f"n={ft['n_clips']}  SNR={ft['snr_range_db']}  seed={ft['seed']}",
         ]
-    f1024 = results["fixed1024_20db"]
+    if "fixed1024_20db" in results:
+        f1024 = results["fixed1024_20db"]
+        lines += [
+            f"fixed1024@20dB: angle MAE={f1024['angle_mae_deg']:.4f}°  "
+            f"distance MAE={f1024['distance_mae_m']:.4f} m  "
+            f"n={f1024['n_clips']}  SNR={f1024['snr_range_db']}  seed={f1024['seed']}",
+        ]
     lines += [
-        f"fixed1024@20dB: angle MAE={f1024['angle_mae_deg']:.4f}°  "
-        f"distance MAE={f1024['distance_mae_m']:.4f} m  "
-        f"n={f1024['n_clips']}  SNR={f1024['snr_range_db']}  seed={f1024['seed']}",
         f"chance (train-mean on test): angle={chance_test['chance_angle_mae_deg']:.4f}°  "
         f"distance={chance_test['chance_distance_mae_m']:.4f} m",
         f"train mean constants: angle={chance_test['train_mean_angle_deg']:.6f}°  "
         f"distance={chance_test['train_mean_distance_m']:.6f} m",
         f"corpus sizes: train={results['corpus']['train_n']}  "
         f"val={results['corpus']['val_n']}  test={results['corpus']['test_n']}",
+        f"test speech: {test_speech}",
+        f"test noise: {test_noise}",
     ]
     (out_dir / "a1_summary.txt").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
