@@ -485,6 +485,9 @@ def train_variant(
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=0)
 
     history = []
+    best_score = float("inf")
+    best_epoch = 0
+    best_state = None
     for ep in range(1, epochs + 1):
         _set_readout_train_mode(model)
         t0 = time.time()
@@ -507,25 +510,34 @@ def train_variant(
         model.eval()
         with torch.no_grad():
             val_m = eval_cache(model, val_cache, device, rad_resolution)
+        score = val_m["angle_mae_deg"] + 10.0 * val_m["distance_mae_m"]
         row = {
             "epoch": ep,
             "train_loss": loss_sum / max(n_seen, 1),
             "val_angle_mae_deg": val_m["angle_mae_deg"],
             "val_distance_mae_m": val_m["distance_mae_m"],
+            "val_score": score,
             "sec": time.time() - t0,
         }
         history.append(row)
+        if score < best_score:
+            best_score = score
+            best_epoch = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         print(
             f"  ep{ep}: loss={row['train_loss']:.4f}  "
             f"val={row['val_angle_mae_deg']:.3f}°/{row['val_distance_mae_m']:.3f}m  "
             f"({row['sec']:.1f}s)",
             flush=True,
         )
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=False)
     return {
         "n_trainable_params": n_train,
         "n_frozen_params": n_frozen,
         "history": history,
-        "best_epoch": int(min(history, key=lambda r: r["val_angle_mae_deg"] + 10 * r["val_distance_mae_m"])["epoch"]),
+        "best_epoch": int(best_epoch),
+        "best_val_score": float(best_score),
     }
 
 
